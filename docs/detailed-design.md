@@ -593,6 +593,11 @@ Redis (or Valkey, the open-source fork) provides ephemeral state storage with TT
 | `ratelimit:bot:{bot_id}:messages` | String | count | 60 sec | Bot message rate limit |
 | `ratelimit:bot:{bot_id}:api` | String | count | 60 sec | Bot API rate limit |
 | `bot:response_url:{token}` | Hash | `{channel_id, message_id, bot_id}` | 30 min | Slash command response URL context |
+| `push_prefs:{user_id}` | Hash | `{push_enabled, dm_message, mention, quiet_start, quiet_end}` | 1 hour | Push notification preferences cache |
+| `push_recent:{user_id}:{channel_id}` | String | `1` | 30 sec | Push deduplication window |
+| `unread:dm:{user_id}` | String | count | none | Unread DM count for badge |
+| `unread:mentions:{user_id}` | String | count | none | Unread mentions count for badge |
+| `badge:{user_id}` | String | count | none | Total badge count cache |
 
 ### Pub/Sub Channels
 
@@ -939,4 +944,5 @@ For detailed deployment configuration and failure scenarios, see [Multi-Region F
 - [Features](./features/) — Detailed specifications for threads, reconnection, receipts, etc.
 - [Authentication](./features/authentication.md) — OIDC integration and login flows
 - [Bot Integration](./features/bot-integration.md) — Bot authentication, webhooks, and API
+- [Push Notifications](./features/push-notifications.md) — APNs and FCM push delivery
 - [ADRs](./adrs/) — Architecture decision records
