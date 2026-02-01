@@ -28,16 +28,13 @@
 
 Authentication is handled via **external OIDC (OpenID Connect) providers**. The platform does not store user passwords — all authentication is delegated to trusted identity providers.
 
-### Supported Providers
+### Identity Provider
 
 | Provider | Protocol | Use Case |
 |----------|----------|----------|
 | Keycloak | OIDC | Self-hosted enterprise SSO |
-| Okta | OIDC | Enterprise SSO |
-| Auth0 | OIDC | SaaS applications |
-| Azure AD | OIDC | Microsoft enterprise |
-| Google Workspace | OIDC | Google enterprise |
-| Generic OIDC | OIDC | Any compliant provider |
+
+The platform integrates exclusively with **Keycloak** for identity management, providing full control over user authentication, authorization, and federation capabilities.
 
 ### Design Principles
 
@@ -56,9 +53,9 @@ Authentication is handled via **external OIDC (OpenID Connect) providers**. The 
 │                        Authentication Architecture                           │
 │                                                                              │
 │  ┌──────────┐                                          ┌─────────────────┐  │
-│  │  Client  │◄────────────────────────────────────────►│  OIDC Provider  │  │
-│  │  (Web/   │         Authorization Code Flow          │  (Keycloak/     │  │
-│  │  Mobile) │                                          │   Okta/etc)     │  │
+│  │  Client  │◄────────────────────────────────────────►│    Keycloak     │  │
+│  │  (Web/   │         Authorization Code Flow          │                 │  │
+│  │  Mobile) │                                          │                 │  │
 │  └────┬─────┘                                          └────────┬────────┘  │
 │       │                                                         │           │
 │       │ Access Token (JWT)                                      │           │
@@ -98,24 +95,24 @@ Authentication is handled via **external OIDC (OpenID Connect) providers**. The 
 
 | Component | Responsibility |
 |-----------|---------------|
-| **OIDC Provider** | User authentication, identity management |
+| **Keycloak** | User authentication, identity management, federation |
 | **API Gateway** | JWT validation, rate limiting |
 | **Auth Service** | Token exchange, session management, user provisioning |
 | **Redis** | Session storage, refresh tokens, auth state |
-| **MongoDB** | User profiles (synced from OIDC) |
+| **MongoDB** | User profiles (synced from Keycloak) |
 
 ---
 
-## 3. OIDC Integration
+## 3. Keycloak Integration
 
-### 3.1 Provider Configuration
+### 3.1 Keycloak Configuration
 
 ```yaml
 # config/auth.yaml
 oidc:
-  provider: "keycloak"  # or "okta", "auth0", "azure", "google", "generic"
+  provider: "keycloak"
 
-  # OIDC Discovery
+  # Keycloak OIDC Discovery
   issuer: "https://auth.example.com/realms/chat"
   discovery_url: "https://auth.example.com/realms/chat/.well-known/openid-configuration"
 
@@ -211,8 +208,8 @@ func (c *JWKSCache) refresh(kid string) (*rsa.PublicKey, error) {
 
 ```
 ┌──────────┐                              ┌──────────────┐                    ┌─────────────┐
-│  Client  │                              │ Auth Service │                    │    OIDC     │
-│          │                              │              │                    │  Provider   │
+│  Client  │                              │ Auth Service │                    │  Keycloak   │
+│          │                              │              │                    │             │
 └────┬─────┘                              └──────┬───────┘                    └──────┬──────┘
      │                                           │                                   │
      │ 1. Generate code_verifier, code_challenge │                                   │
@@ -223,10 +220,10 @@ func (c *JWKSCache) refresh(kid string) (*rsa.PublicKey, error) {
      │                                           │ 3. Store state + code_verifier    │
      │                                           │    in Redis (5min TTL)            │
      │                                           │                                   │
-     │ 4. Redirect to OIDC authorize endpoint    │                                   │
+     │ 4. Redirect to Keycloak authorize endpoint │                                   │
      │◄──────────────────────────────────────────│                                   │
      │                                           │                                   │
-     │ 5. Redirect to OIDC provider              │                                   │
+     │ 5. Redirect to Keycloak                   │                                   │
      │──────────────────────────────────────────────────────────────────────────────►│
      │                                           │                                   │
      │                                           │                    6. User login  │
@@ -1194,23 +1191,23 @@ sequenceDiagram
     participant Client
     participant AuthSvc as Auth Service
     participant Redis
-    participant OIDC as OIDC Provider
+    participant Keycloak
     participant MongoDB
     participant NATS
 
     Client->>AuthSvc: GET /auth/login
     AuthSvc->>AuthSvc: Generate state, PKCE
     AuthSvc->>Redis: Store auth state (5min TTL)
-    AuthSvc-->>Client: Redirect to OIDC
+    AuthSvc-->>Client: Redirect to Keycloak
 
-    Client->>OIDC: Authorization request
-    OIDC->>OIDC: User authenticates
-    OIDC-->>Client: Redirect with auth code
+    Client->>Keycloak: Authorization request
+    Keycloak->>Keycloak: User authenticates
+    Keycloak-->>Client: Redirect with auth code
 
     Client->>AuthSvc: GET /auth/callback?code=xxx&state=yyy
     AuthSvc->>Redis: Validate & get auth state
-    AuthSvc->>OIDC: Exchange code for tokens
-    OIDC-->>AuthSvc: {access_token, refresh_token, id_token}
+    AuthSvc->>Keycloak: Exchange code for tokens
+    Keycloak-->>AuthSvc: {access_token, refresh_token, id_token}
 
     AuthSvc->>AuthSvc: Validate ID token
     AuthSvc->>MongoDB: Get or create user
@@ -1230,7 +1227,7 @@ sequenceDiagram
     participant Client
     participant Gateway as API Gateway
     participant AuthSvc as Auth Service
-    participant OIDC as OIDC Provider
+    participant Keycloak
     participant CmdSvc as Command Service
 
     Client->>Gateway: POST /api/chat.sendMessage<br/>Authorization: Bearer {expired_token}
@@ -1239,8 +1236,8 @@ sequenceDiagram
 
     Client->>AuthSvc: POST /auth/refresh<br/>Cookie: session_id
     AuthSvc->>AuthSvc: Get refresh token from Redis
-    AuthSvc->>OIDC: Refresh token request
-    OIDC-->>AuthSvc: New access token
+    AuthSvc->>Keycloak: Refresh token request
+    Keycloak-->>AuthSvc: New access token
     AuthSvc-->>Client: {access_token, expires_in}
 
     Client->>Gateway: POST /api/chat.sendMessage<br/>Authorization: Bearer {new_token}
