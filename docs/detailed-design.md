@@ -945,4 +945,5 @@ For detailed deployment configuration and failure scenarios, see [Multi-Region F
 - [Authentication](./features/authentication.md) — OIDC integration and login flows
 - [Bot Integration](./features/bot-integration.md) — Bot authentication, webhooks, and API
 - [Push Notifications](./features/push-notifications.md) — APNs and FCM push delivery
+- [API Reference](./api/api-reference.md) — REST API endpoints and migration guide
 - [ADRs](./adrs/) — Architecture decision records
