@@ -535,6 +535,7 @@ The Webhook Dispatcher tracks consecutive failures per webhook. If a webhook rea
 | `FILES` | `files.>` | WorkQueue | 24 hours | 3 | File upload processing (virus scan, thumbnails, metadata) |
 | `SYSTEM` | `system.>` | Limits | 7 days | 3 | Audit logs, admin events, internal signals |
 | `AUTH` | `auth.>` | Limits | 7 days | 3 | User login/logout events, session events |
+| `BOTS` | `bots.>` | Limits | 7 days | 3 | Bot events (slash commands, interactive actions) |
 
 ### 4.2 Consumers
 
@@ -589,6 +590,9 @@ Redis (or Valkey, the open-source fork) provides ephemeral state storage with TT
 | `refresh_token:{session_id}` | Hash | `{token (encrypted), user_id, client_type, created_at, last_used_at}` | 7 days | Encrypted refresh token |
 | `user_sessions:{user_id}` | Set | session_ids | none | Active sessions per user |
 | `ws_token:{token}` | Hash | `{user_id, session_id, created_at}` | 30 sec | One-time WebSocket auth token |
+| `ratelimit:bot:{bot_id}:messages` | String | count | 60 sec | Bot message rate limit |
+| `ratelimit:bot:{bot_id}:api` | String | count | 60 sec | Bot API rate limit |
+| `bot:response_url:{token}` | Hash | `{channel_id, message_id, bot_id}` | 30 min | Slash command response URL context |
 
 ### Pub/Sub Channels
 
@@ -934,4 +938,5 @@ For detailed deployment configuration and failure scenarios, see [Multi-Region F
 - [Sequence Diagrams](./diagrams/sequence-diagrams.md) — Flow diagrams for key operations
 - [Features](./features/) — Detailed specifications for threads, reconnection, receipts, etc.
 - [Authentication](./features/authentication.md) — OIDC integration and login flows
+- [Bot Integration](./features/bot-integration.md) — Bot authentication, webhooks, and API
 - [ADRs](./adrs/) — Architecture decision records
