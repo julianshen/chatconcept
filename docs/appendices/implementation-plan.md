@@ -1,0 +1,238 @@
+# Implementation Plan
+
+This document outlines the phased implementation approach for the Communication Platform.
+
+**Related Documents:**
+- [Architecture Overview](../overview.md) — High-level architecture
+- [Risks and Mitigations](./risks.md) — Risk register
+- [ADR Index](../adrs/README.md) — Architecture decisions
+
+---
+
+## Implementation Phases
+
+| Phase | Scope | Duration (Est.) | Dependencies | Risk |
+|-------|-------|-----------------|--------------|------|
+| **0: Foundation** | Deploy NATS JetStream cluster (3-node). Deploy Cassandra cluster (3-node, RF=3). Set up CI/CD, observability stack. | 2–3 weeks | Infrastructure provisioning | Low |
+| **1: Command Path** | Build Command Service. Implement event publishing for `messages.send`, `messages.edit`, `messages.delete`. Build Message Writer worker. Validate Cassandra schema and write path. | 3–4 weeks | Phase 0 | Medium |
+| **2: Query Path** | Build Query Service implementing Rocket.Chat REST API read endpoints. Connect to Cassandra for message history, MongoDB for metadata. | 2–3 weeks | Phase 1 | Low |
+| **3: Fan-Out & Notification** | Build Fan-Out Service with routing table, presence watcher, membership consumer. Build Notification Service with WebSocket protocol, local routing, instance inbox subscription. | 4–5 weeks | Phase 1 | **High** (core innovation) |
+| **4: Workers & Webhooks** | Build Search Indexer, Push Notification Worker, Meta Writer. Build Webhook Dispatcher with outgoing delivery, retry, HMAC signing, delivery log, auto-disable. Build incoming webhook endpoint in Command Service. Set up Elasticsearch. Set up WEBHOOKS stream and webhook Cassandra tables. | 3–4 weeks | Phase 1 | Medium |
+| **5: Migration & Cutover** | Data migration from MongoDB messages to Cassandra. Dual-write period. Shadow traffic testing. Gradual client cutover. Migrate existing Rocket.Chat integrations to incoming/outgoing webhook model. | 3–4 weeks | Phases 1–4 | High |
+| **6: Decommission** | Remove Meteor.js oplog tailing. Remove message collections from MongoDB. Optimize and tune. | 1–2 weeks | Phase 5 stable | Low |
+
+---
+
+## Phase Details
+
+### Phase 0: Foundation (2-3 weeks)
+
+**Objectives:**
+- Production-ready NATS JetStream cluster
+- Production-ready Cassandra cluster
+- Observability infrastructure
+
+**Deliverables:**
+- [ ] NATS JetStream 3-node cluster deployed
+- [ ] Cassandra 3-node cluster with RF=3 deployed
+- [ ] CI/CD pipelines configured
+- [ ] Prometheus + Grafana monitoring stack
+- [ ] OpenTelemetry tracing infrastructure
+- [ ] Centralized logging (ELK or Loki)
+
+**Success Criteria:**
+- NATS cluster survives single-node failure
+- Cassandra cluster survives single-node failure
+- All metrics dashboards operational
+
+---
+
+### Phase 1: Command Path (3-4 weeks)
+
+**Objectives:**
+- Validate CQRS write path
+- Establish event schema patterns
+- Prove Cassandra write performance
+
+**Deliverables:**
+- [ ] Command Service with message endpoints
+- [ ] Message Writer pull consumer
+- [ ] Cassandra `messages` table with TWCS
+- [ ] Event schema validation
+- [ ] Publisher deduplication (Nats-Msg-Id)
+
+**Success Criteria:**
+- 10K messages/sec sustained write throughput
+- < 5ms client response time (202 Accepted)
+- Zero message loss under load
+
+---
+
+### Phase 2: Query Path (2-3 weeks)
+
+**Objectives:**
+- REST API compatibility with existing clients
+- Efficient message history queries
+
+**Deliverables:**
+- [ ] Query Service with cursor-based pagination
+- [ ] Message history from Cassandra
+- [ ] Metadata from MongoDB
+- [ ] Token-aware Cassandra client
+
+**Success Criteria:**
+- API compatibility with existing Rocket.Chat clients
+- < 50ms P99 for message history queries
+- Cursor pagination handles large channels
+
+---
+
+### Phase 3: Fan-Out & Notification (4-5 weeks)
+
+**Objectives:**
+- Instance-level fan-out architecture
+- WebSocket connection management
+- Presence tracking
+
+**Deliverables:**
+- [ ] Fan-Out Service with routing table
+- [ ] Presence watcher (NATS KV)
+- [ ] Membership consumer
+- [ ] Notification Service with WebSocket manager
+- [ ] Local routing table
+- [ ] Instance inbox subscription
+- [ ] Typing indicator handling
+
+**Success Criteria:**
+- Support 100K+ channel memberships per user
+- < 10ms event delivery latency
+- Routing table cold start < 60s
+- Zero per-channel NATS subscriptions
+
+**Risk Mitigation:**
+- This phase carries highest risk as core innovation
+- Plan for additional debugging and optimization time
+- Consider parallel workstream for fallback approach
+
+---
+
+### Phase 4: Workers & Webhooks (3-4 weeks)
+
+**Objectives:**
+- Complete worker pool ecosystem
+- Webhook platform for integrations
+
+**Deliverables:**
+- [ ] Search Indexer worker
+- [ ] Push Notification worker
+- [ ] Meta Writer worker
+- [ ] Webhook Dispatcher with retry logic
+- [ ] Incoming webhook endpoint
+- [ ] Elasticsearch cluster
+- [ ] Webhook delivery log in Cassandra
+
+**Success Criteria:**
+- Search indexing keeps pace with message volume
+- Push notifications delivered < 1s
+- Webhook retry with exponential backoff
+- HMAC signature verification working
+
+---
+
+### Phase 5: Migration & Cutover (3-4 weeks)
+
+**Objectives:**
+- Zero-downtime migration
+- Data integrity verification
+- Gradual traffic cutover
+
+**Deliverables:**
+- [ ] Historical data migration scripts
+- [ ] Dual-write infrastructure
+- [ ] Shadow traffic testing
+- [ ] Canary deployment tooling
+- [ ] Rollback procedures documented
+
+**Success Criteria:**
+- All historical messages migrated
+- Dual-write consistency verified
+- Canary deployment at 5% → 25% → 50% → 100%
+- Rollback tested and documented
+
+---
+
+### Phase 6: Decommission (1-2 weeks)
+
+**Objectives:**
+- Remove legacy infrastructure
+- Optimize production configuration
+
+**Deliverables:**
+- [ ] Meteor.js oplog tailing removed
+- [ ] MongoDB message collections dropped
+- [ ] Production performance tuning
+- [ ] Documentation updated
+
+**Success Criteria:**
+- No remaining dependencies on legacy systems
+- Performance meets or exceeds baseline
+- Operational runbooks complete
+
+---
+
+## Rollout Strategy
+
+### 1. Shadow Mode
+
+Deploy new architecture alongside existing Meteor.js:
+- Command Service publishes events
+- Workers write to both Cassandra and MongoDB
+- Fan-Out + Notification Service run in shadow mode
+- Compare latency and correctness metrics
+
+### 2. Canary Deployment
+
+Route 5% of WebSocket connections to new Notification Service:
+- Monitor delivery latency
+- Track missed messages
+- Validate fan-out correctness
+
+### 3. Gradual Rollout
+
+Increase traffic incrementally:
+- 5% → 25% → 50% → 100%
+- 2-week rollout period
+- Continuous monitoring at each stage
+
+### 4. Rollback Plan
+
+Gateway routing can switch back to Meteor.js instantly:
+- Dual-write ensures MongoDB remains up-to-date
+- Client reconnection to legacy system is transparent
+- Rollback decision within 5 minutes of detecting issues
+
+---
+
+## Team Allocation (Suggested)
+
+| Phase | Team Size | Key Roles |
+|-------|-----------|-----------|
+| Phase 0 | 2 | DevOps, SRE |
+| Phase 1-2 | 3 | Backend engineers |
+| Phase 3 | 4 | Backend engineers, Systems engineer |
+| Phase 4 | 3 | Backend engineers |
+| Phase 5-6 | 4 | Full team, DBA support |
+
+---
+
+## Milestones
+
+| Milestone | Target | Gate Criteria |
+|-----------|--------|---------------|
+| **M1: Infrastructure Ready** | End of Phase 0 | Clusters healthy, monitoring live |
+| **M2: Write Path Validated** | End of Phase 1 | 10K msg/sec, zero loss |
+| **M3: Read Path Complete** | End of Phase 2 | API compatible |
+| **M4: Real-time Delivery** | End of Phase 3 | WebSocket fan-out working |
+| **M5: Full Feature Parity** | End of Phase 4 | Search, push, webhooks |
+| **M6: Production Cutover** | End of Phase 5 | 100% traffic on new system |
+| **M7: Legacy Decommissioned** | End of Phase 6 | Clean architecture |
