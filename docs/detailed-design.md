@@ -61,10 +61,30 @@
 
 1. Accept write requests (send message, create channel, update profile, etc.)
 2. Validate input (schema validation, authorization checks against cached permissions)
-3. Publish a domain event to the appropriate NATS JetStream stream
-4. Return an immediate acknowledgment to the client (HTTP 202 Accepted) with a correlation ID
+3. **Preprocess messages:** Parse markdown, extract mentions/links, validate adaptive cards, resolve emoji
+4. Route by message type: regular messages → MESSAGES stream, ephemeral → EPHEMERAL stream
+5. Publish a domain event to the appropriate NATS JetStream stream
+6. Return an immediate acknowledgment to the client (HTTP 202 Accepted) with a correlation ID
 
-**Key Design Principle:** The Command Service does **not** write directly to any database. It validates and publishes. This is the fundamental decoupling from the old Meteor architecture.
+**Key Design Principle:** The Command Service does **not** write directly to any database. It validates, preprocesses, and publishes. This is the fundamental decoupling from the old Meteor architecture.
+
+#### Message Preprocessing Pipeline
+
+```
+┌──────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────┐
+│ Validate │──►│ Preprocess   │──►│ Route by     │──►│ Publish  │
+│ Request  │   │ Message      │   │ Message Type │   │ to NATS  │
+└──────────┘   └──────────────┘   └──────────────┘   └──────────┘
+                     │                   │
+                     ▼                   ▼
+              • Parse markdown     • Plain/Rich → MESSAGES
+              • Extract @mentions  • Ephemeral → EPHEMERAL
+              • Extract URLs       • Card → validate, MESSAGES
+              • Validate cards
+              • Resolve :emoji:
+```
+
+See [Message Formats](./features/message-formats.md) for detailed preprocessing specifications.
 
 #### NATS Subject Hierarchy
 
@@ -439,6 +459,8 @@ The Webhook Dispatcher tracks consecutive failures per webhook. If a webhook rea
 | `NOTIFICATIONS` | `notifications.push.>` | WorkQueue | 7 days | 3 | Push notification delivery queue |
 | `WEBHOOKS` | `webhooks.outgoing.>` | Limits | 7 days | 3 | Outgoing webhook delivery queue |
 | `RECEIPTS` | `receipts.>` | WorkQueue | 7 days | 3 | Read/delivery receipts for small groups |
+| `EPHEMERAL` | `ephemeral.>` | WorkQueue | 5 min | 1 | Ephemeral messages (not persisted, immediate delivery only) |
+| `LINK_PREVIEW` | `link_preview.>` | WorkQueue | 1 hour | 3 | Link preview fetch requests and results |
 | `SYSTEM` | `system.>` | Limits | 7 days | 3 | Audit logs, admin events, internal signals |
 
 ### 4.2 Consumers
@@ -453,6 +475,8 @@ The Webhook Dispatcher tracks consecutive failures per webhook. If a webhook rea
 | `push-worker-pool` | NOTIFICATIONS | Pull, Durable | `notifications.push.>` | Deliver push notifications |
 | `webhook-dispatch-pool` | WEBHOOKS | Pull, Durable | `webhooks.outgoing.>` | Deliver outgoing webhooks |
 | `receipt-writer-pool` | RECEIPTS | Pull, Durable | `receipts.>` | Persist per-message receipts (small groups) |
+| `ephemeral-fan-out` | EPHEMERAL | Pull, Durable | `ephemeral.>` | Fan-out ephemeral messages to target user only |
+| `link-preview-pool` | LINK_PREVIEW | Pull, Durable | `link_preview.fetch.>` | Fetch URL metadata and publish previews |
 
 ### 4.3 Core NATS Subjects (Ephemeral, No Persistence)
 
