@@ -36,7 +36,7 @@
 
 ### 1.1 API Gateway
 
-**Technology:** Envoy Proxy (or Nginx with lua-resty modules)
+**Technology:** Envoy Proxy (Istio Ingress Gateway)
 
 **Responsibilities:**
 

@@ -173,7 +173,7 @@ graph TB
     end
 
     subgraph Gateway["API Gateway Layer"]
-        GW["API Gateway<br/>[Envoy / Nginx]<br/>Rate Limiting, TLS,<br/>Auth, Route Splitting"]
+        GW["API Gateway<br/>[Istio Ingress]<br/>Rate Limiting, TLS,<br/>Auth, Route Splitting"]
     end
 
     subgraph CommandPath["Command Path (Write Side)"]
@@ -244,7 +244,7 @@ graph TB
 
 | Component | Technology | Responsibility |
 |-----------|------------|----------------|
-| **API Gateway** | Envoy / Nginx | TLS, JWT validation, rate limiting, route splitting |
+| **API Gateway** | Istio Ingress Gateway | TLS, JWT validation, rate limiting, route splitting |
 | **Command Service** | Go | Validate writes, publish events to NATS (never writes to DB) |
 | **Query Service** | Go | Serve REST reads from Cassandra, MongoDB, Elasticsearch |
 | **Fan-Out Service** | Go | Route channel events to Notification Service instance inboxes |
