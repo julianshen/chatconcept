@@ -15,6 +15,7 @@
    - [Query Service](#13-query-service)
    - [Fan-Out Service](#14-fan-out-service)
    - [Notification Service](#15-notification-service)
+   - [Auth Service](#16-auth-service)
 2. [Worker Pool Specifications](#2-worker-pool-specifications)
    - [Message Writer Worker](#21-message-writer-worker)
    - [Meta Writer Worker](#22-meta-writer-worker)
@@ -256,6 +257,76 @@ When a user connects, the instance loads their channel memberships (from cache o
 
 ---
 
+### 1.6 Auth Service
+
+**Technology:** Go
+
+**Responsibilities:**
+
+1. Handle OIDC authentication flows (Authorization Code + PKCE)
+2. Exchange authorization codes for tokens with OIDC provider
+3. Manage refresh tokens (encrypted storage in Redis)
+4. Create and validate user sessions
+5. Provision users on first login (JIT provisioning)
+6. Generate one-time WebSocket authentication tokens
+7. Handle logout flows (local and OIDC single sign-out)
+
+**Key Design Principle:** The Auth Service is the only component that communicates with the OIDC provider. All other services rely on JWT tokens validated at the API Gateway.
+
+#### Authentication Flow
+
+```
+┌──────────┐                    ┌──────────────┐                    ┌─────────────┐
+│  Client  │                    │ Auth Service │                    │    OIDC     │
+└────┬─────┘                    └──────┬───────┘                    └──────┬──────┘
+     │ 1. GET /auth/login              │                                   │
+     │────────────────────────────────►│                                   │
+     │                                 │ 2. Store state + PKCE in Redis    │
+     │ 3. Redirect to OIDC             │                                   │
+     │◄────────────────────────────────│                                   │
+     │ 4. User authenticates           │                                   │
+     │──────────────────────────────────────────────────────────────────────►
+     │ 5. Redirect with auth code      │                                   │
+     │◄──────────────────────────────────────────────────────────────────────
+     │ 6. GET /auth/callback           │                                   │
+     │────────────────────────────────►│                                   │
+     │                                 │ 7. Exchange code for tokens       │
+     │                                 │──────────────────────────────────►│
+     │                                 │◄──────────────────────────────────│
+     │                                 │ 8. Provision/update user          │
+     │                                 │ 9. Create session                 │
+     │ 10. Session cookie + access     │                                   │
+     │◄────────────────────────────────│                                   │
+```
+
+#### Token Management
+
+| Token | Lifetime | Storage | Purpose |
+|-------|----------|---------|---------|
+| **Access Token** | 15 min | Client memory | JWT for API authentication |
+| **Refresh Token** | 7 days | Redis (encrypted) | Obtain new access tokens |
+| **Session Token** | 7 days | HTTP-only cookie | Identify session for refresh |
+| **WS Auth Token** | 30 sec | Redis | One-time WebSocket auth |
+
+#### API Endpoints
+
+```
+POST /auth/login       → Initiate OIDC login, return auth URL
+GET  /auth/callback    → Handle OIDC callback, exchange code
+POST /auth/refresh     → Refresh access token (uses session cookie)
+POST /auth/ws-token    → Generate one-time WebSocket token
+POST /auth/logout      → Local logout (terminates session)
+POST /auth/logout/all  → Logout all devices
+GET  /auth/sessions    → List active sessions for user
+DELETE /auth/sessions/{id} → Revoke specific session
+```
+
+**Scaling:** Stateless — any instance can handle requests. Session state stored in Redis.
+
+See [Authentication Feature Documentation](./features/authentication.md) for detailed specifications.
+
+---
+
 ## 2. Worker Pool Specifications
 
 Workers are **pull-based JetStream consumers** — they request batches of messages, process them, and acknowledge.
@@ -463,6 +534,7 @@ The Webhook Dispatcher tracks consecutive failures per webhook. If a webhook rea
 | `LINK_PREVIEW` | `link_preview.>` | WorkQueue | 1 hour | 3 | Link preview fetch requests and results |
 | `FILES` | `files.>` | WorkQueue | 24 hours | 3 | File upload processing (virus scan, thumbnails, metadata) |
 | `SYSTEM` | `system.>` | Limits | 7 days | 3 | Audit logs, admin events, internal signals |
+| `AUTH` | `auth.>` | Limits | 7 days | 3 | User login/logout events, session events |
 
 ### 4.2 Consumers
 
@@ -481,6 +553,7 @@ The Webhook Dispatcher tracks consecutive failures per webhook. If a webhook rea
 | `file-virus-scan` | FILES | Pull, Durable | `files.uploaded` | Virus scan uploaded files |
 | `file-thumbnail` | FILES | Pull, Durable | `files.uploaded` | Generate thumbnails for images/videos |
 | `file-metadata` | FILES | Pull, Durable | `files.uploaded` | Extract file metadata (dimensions, duration, etc.) |
+| `auth-audit-pool` | AUTH | Pull, Durable | `auth.>` | Audit logging for authentication events |
 
 ### 4.3 Core NATS Subjects (Ephemeral, No Persistence)
 
@@ -489,6 +562,7 @@ The Webhook Dispatcher tracks consecutive failures per webhook. If a webhook rea
 | `instance.events.{instance_id}` | Fan-Out Service | Notification Service (one per instance) | Deliver pre-routed channel events |
 | `client.typing.{channel_id}` | Notification Service | Fan-Out Service | Forward typing indicators |
 | `presence.change` | Notification Service | Fan-Out Service | Broadcast online/offline transitions |
+| `session.logout` | Auth Service | Notification Service | Terminate WebSocket for logged-out session |
 
 ---
 
@@ -510,6 +584,11 @@ Redis (or Valkey, the open-source fork) provides ephemeral state storage with TT
 | `thread-read:{user_id}:{thread_id}` | Hash | `{last_read_id:..., last_read_at:...}` | 30 days | Per-user per-thread read position |
 | `thread-latest:{thread_id}` | Hash | `{latest_id:..., latest_at:..., reply_count:N}` | none | Most recent reply per thread |
 | `client-state:{user_id}` | Hash | `{last_event_seq:N, instance_id:..., active_channels:[...]}` | 24 hours | Client reconnection state |
+| `auth_state:{state}` | Hash | `{state, code_verifier, redirect_uri, client_type}` | 5 min | OIDC auth state (PKCE) |
+| `session:{session_id}` | Hash | `{user_id, client_type, device_id, ip, created_at, last_active_at}` | 7 days | User session |
+| `refresh_token:{session_id}` | Hash | `{token (encrypted), user_id, client_type, created_at, last_used_at}` | 7 days | Encrypted refresh token |
+| `user_sessions:{user_id}` | Set | session_ids | none | Active sessions per user |
+| `ws_token:{token}` | Hash | `{user_id, session_id, created_at}` | 30 sec | One-time WebSocket auth token |
 
 ### Pub/Sub Channels
 
@@ -854,4 +933,5 @@ For detailed deployment configuration and failure scenarios, see [Multi-Region F
 - [C4 Diagrams](./diagrams/c4-diagrams.md) — Visual architecture diagrams
 - [Sequence Diagrams](./diagrams/sequence-diagrams.md) — Flow diagrams for key operations
 - [Features](./features/) — Detailed specifications for threads, reconnection, receipts, etc.
+- [Authentication](./features/authentication.md) — OIDC integration and login flows
 - [ADRs](./adrs/) — Architecture decision records
