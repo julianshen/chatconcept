@@ -23,6 +23,16 @@ Dual-write strategy with separate `thread_messages` table partitioned by `(threa
 
 ---
 
+### File Uploads
+
+> Should file metadata events flow through NATS, or should uploads use a direct-to-object-storage flow with only a reference event published?
+
+**Resolution:** See [File Uploads Feature](../features/file-uploads.md).
+
+Hybrid approach: Direct S3 upload via presigned URLs, then `completeUpload` API publishes event to FILES stream for processing (virus scan, thumbnails, metadata extraction).
+
+---
+
 ### Read Receipts / Delivery Receipts
 
 > Should delivery confirmation flow back from Notification Service → Fan-Out Service → Cassandra? This creates a write amplification concern.
@@ -58,23 +68,6 @@ Jump consistent hashing with 256 fixed partitions. Workers assigned contiguous r
 ---
 
 ## Open Questions
-
-### File Uploads
-
-> Should file metadata events flow through NATS, or should uploads use a direct-to-object-storage flow with only a reference event published?
-
-**Options:**
-1. **Full event flow:** Upload metadata → NATS → Message Writer → Cassandra
-2. **Direct upload:** Client → S3 presigned URL → Reference event only
-
-**Considerations:**
-- Direct upload reduces latency for large files
-- Event flow maintains consistency with message processing
-- Hybrid: presigned upload + reference event after upload complete
-
-**Status:** Needs design decision
-
----
 
 ### Federation
 
@@ -204,7 +197,7 @@ Jump consistent hashing with 256 fixed partitions. Workers assigned contiguous r
 | Read receipts | 2026-02-01 | 2026-02-01 | ADR-008 |
 | Client reconnection | 2026-02-01 | 2026-02-01 | ADR-007 |
 | Fan-out partitioning | 2026-02-01 | 2026-02-01 | ADR-009 |
-| File uploads | 2026-02-01 | — | Open |
+| File uploads | 2026-02-01 | 2026-02-01 | Direct S3 + event |
 | Federation | 2026-02-01 | — | Deferred |
 | E2E encryption | 2026-02-01 | — | Open |
 | Message retention | 2026-02-01 | — | Open |
