@@ -946,4 +946,5 @@ For detailed deployment configuration and failure scenarios, see [Multi-Region F
 - [Bot Integration](./features/bot-integration.md) — Bot authentication, webhooks, and API
 - [Push Notifications](./features/push-notifications.md) — APNs and FCM push delivery
 - [API Reference](./api/api-reference.md) — REST API endpoints and migration guide
+- [Security Architecture](./security/security-architecture.md) — Security controls and compliance
 - [ADRs](./adrs/) — Architecture decision records
