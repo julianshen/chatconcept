@@ -564,6 +564,8 @@ The Webhook Dispatcher tracks consecutive failures per webhook. If a webhook rea
 | `client.typing.{channel_id}` | Notification Service | Fan-Out Service | Forward typing indicators |
 | `presence.change` | Notification Service | Fan-Out Service | Broadcast online/offline transitions |
 | `session.logout` | Auth Service | Notification Service | Terminate WebSocket for logged-out session |
+| `user.sync.{user_id}` | Notification Service | Notification Service (all instances) | Cross-device state sync (read, draft, etc.) |
+| `presence.changed.{user_id}` | Notification Service | Fan-Out Service | Per-user presence broadcasts |
 
 ---
 
@@ -598,6 +600,10 @@ Redis (or Valkey, the open-source fork) provides ephemeral state storage with TT
 | `unread:dm:{user_id}` | String | count | none | Unread DM count for badge |
 | `unread:mentions:{user_id}` | String | count | none | Unread mentions count for badge |
 | `badge:{user_id}` | String | count | none | Total badge count cache |
+| `conn:{user_id}:{device_id}` | Hash | `{instance_id, connected_at, client_state, focused_channel}` | 120 sec | Active WebSocket connection per device |
+| `unread:{user_id}` | Hash | `{ch_general: N, dm_alice_bob: M, _total: X, _mentions: Y}` | none | Per-channel unread counts |
+| `draft:{user_id}:{channel_id}` | Hash | `{text, reply_to, attachments, updated_at}` | 7 days | Message draft sync |
+| `push-coalesce:{user_id}:{channel_id}` | String | count | 5 sec | Notification coalescing window |
 
 ### Pub/Sub Channels
 
