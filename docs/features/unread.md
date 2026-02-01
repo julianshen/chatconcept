@@ -78,6 +78,24 @@ Value:  {
 TTL: 30 days (EXPIRE)
 ```
 
+### Redis Key: `thread-latest:{thread_id}`
+
+Tracks the most recent reply in each thread (for unread computation in Threads View):
+
+```
+Key:    thread-latest:{thread_id}
+Type:   Hash
+Value:  {
+  "latest_id": "msg_01HZ5M...",
+  "latest_at": "2026-02-01T14:25:00Z",
+  "latest_sender": "usr_dan",
+  "reply_count": 42
+}
+TTL: none (persistent)
+```
+
+**Updated by:** The Message Writer Worker, after writing each thread reply to Cassandra.
+
 ---
 
 ## 3. Unread Computation
@@ -205,14 +223,69 @@ func bulkUnreadSync(userID string, channelIDs []string) []UnreadStatus {
 
 ## 6. Thread Unread Indicators
 
-Thread unread follows the same pattern:
+Thread unread follows the same pattern as channel unread:
 
 1. `thread-read:{user_id}:{thread_id}` Redis key tracks last-read position per thread per user
-2. When a thread reply arrives, compare with the user's thread read pointer
-3. Show unread badge on the thread root in the channel timeline
-4. Show unread count in the "Threads" panel
+2. `thread-latest:{thread_id}` Redis key tracks the most recent reply
+3. When a thread reply arrives, compare with the user's thread read pointer
+4. Show unread badge (red dot) on the thread root in the channel timeline
+5. Show unread indicator in the **Threads View** (aggregated thread list)
+
+### Unread Check for Threads
+
+```go
+func hasThreadUnread(userID, threadID string) bool {
+    readPointer, _ := redis.HGetAll("thread-read:" + userID + ":" + threadID)
+    threadLatest, _ := redis.HGetAll("thread-latest:" + threadID)
+
+    if len(threadLatest) == 0 {
+        return false  // no replies yet
+    }
+
+    if len(readPointer) == 0 {
+        return true   // never read → unread if any replies exist
+    }
+
+    return threadLatest["latest_id"] > readPointer["last_read_id"]
+}
+```
+
+### Threads View Bulk Unread Check
+
+For the Threads View (aggregated thread list), bulk check unread status using Redis pipeline:
+
+```go
+func bulkCheckThreadUnread(userID string, threadIDs []string) map[string]bool {
+    pipe := redis.Pipeline()
+    readCmds := make(map[string]*redis.StringStringMapCmd)
+    latestCmds := make(map[string]*redis.StringStringMapCmd)
+
+    for _, tid := range threadIDs {
+        readCmds[tid] = pipe.HGetAll("thread-read:" + userID + ":" + tid)
+        latestCmds[tid] = pipe.HGetAll("thread-latest:" + tid)
+    }
+    pipe.Exec()
+
+    result := make(map[string]bool)
+    for _, tid := range threadIDs {
+        rp := readCmds[tid].Val()
+        latest := latestCmds[tid].Val()
+
+        if len(latest) == 0 {
+            result[tid] = false
+        } else if len(rp) == 0 {
+            result[tid] = true
+        } else {
+            result[tid] = latest["latest_id"] > rp["last_read_id"]
+        }
+    }
+    return result
+}
+```
 
 **Scope limitation:** Only compute thread unread for threads the user **follows**. This bounds the computation to ~10–100 threads per user.
+
+See [Threads View](./threads.md#10-threads-view--aggregated-thread-list) for the complete aggregated threads feature.
 
 ---
 

@@ -480,6 +480,7 @@ Redis (or Valkey, the open-source fork) provides ephemeral state storage with TT
 | `read-pointer:{user_id}:{channel_id}` | Hash | `{last_read_id:..., last_read_at:...}` | none | Per-user per-channel read position |
 | `channel-latest:{channel_id}` | Hash | `{latest_id:..., latest_at:..., message_seq:N}` | none | Most recent message per channel |
 | `thread-read:{user_id}:{thread_id}` | Hash | `{last_read_id:..., last_read_at:...}` | 30 days | Per-user per-thread read position |
+| `thread-latest:{thread_id}` | Hash | `{latest_id:..., latest_at:..., reply_count:N}` | none | Most recent reply per thread |
 | `client-state:{user_id}` | Hash | `{last_event_seq:N, instance_id:..., active_channels:[...]}` | 24 hours | Client reconnection state |
 
 ### Pub/Sub Channels
