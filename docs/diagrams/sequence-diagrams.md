@@ -5,6 +5,7 @@ This document contains the key sequence diagrams showing message flows through t
 **Related Documents:**
 - [Detailed Design](../detailed-design.md) — Component specifications
 - [C4 Diagrams](./c4-diagrams.md) — Architecture views
+- [Multi-Device Sync](../features/multi-device-sync.md) — Cross-device state synchronization
 
 ---
 
@@ -532,3 +533,290 @@ sequenceDiagram
 | User → Channels Index | ~100K users | ~500 MB |
 | Membership Cache | ~50K users (LRU) | ~200 MB |
 | **Total** | — | **~2.2 GB**
+
+---
+
+## 8. Multi-Device Synchronization Flows
+
+These diagrams show how state is synchronized across a user's multiple devices (desktop, mobile, tablet).
+
+### 8.1 Cross-Device Read State Sync
+
+Shows how reading a message on one device propagates to all other devices.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant iPhone as Alice's iPhone<br/>(on notif-02)
+    participant Notif02 as Notification Service<br/>(Instance notif-02)
+    participant Redis as Redis/Valkey
+    participant NATS as NATS Core Pub/Sub
+    participant Notif07 as Notification Service<br/>(Instance notif-07)
+    participant Desktop as Alice's Desktop<br/>(on notif-07)
+    participant PushWorker as Push Worker
+    participant iPad as Alice's iPad<br/>(offline)
+
+    Note over iPhone: Alice reads messages<br/>in #general on iPhone
+
+    iPhone->>Notif02: WS: {"type":"mark_read",<br/>"channel_id":"ch_general",<br/>"message_id":"msg_456"}
+
+    par Update Redis state
+        Notif02->>Redis: HSET unread:alice ch_general 0
+        Notif02->>Redis: HINCRBY unread:alice _total -5
+        Notif02->>Redis: HSET read-pointer:alice:ch_general<br/>{last_read_id: msg_456, last_read_at: ...}
+    end
+
+    Note over Notif02,NATS: Publish sync event to all instances
+
+    Notif02->>NATS: Publish user.sync.alice<br/>{type: "read_sync",<br/>channel_id: "ch_general",<br/>last_read_id: "msg_456",<br/>source_device: "dev_ios_01HZ..."}
+
+    NATS->>Notif07: Deliver (subscribed to user.sync.alice)
+    NATS->>Notif02: Deliver (ignored, same device)
+
+    Notif07->>Notif07: Find local connections for alice<br/>→ [ws_desktop]
+
+    Notif07->>Desktop: WS: {"type":"sync.read",<br/>"channel_id":"ch_general",<br/>"last_read_id":"msg_456"}
+
+    Note over Desktop: Desktop UI updates:<br/>• Clear unread badge for #general<br/>• Update channel list
+
+    Note over Notif02,PushWorker: Badge sync for offline devices
+
+    Notif02->>Redis: SMEMBERS devices:alice:mobile
+    Redis-->>Notif02: [dev_ios_..., dev_ipad_...]
+
+    Notif02->>Redis: EXISTS conn:alice:dev_ipad_*
+    Redis-->>Notif02: 0 (iPad offline)
+
+    Notif02->>PushWorker: Enqueue silent badge update<br/>{device: iPad, badge: 2}
+
+    PushWorker->>iPad: APNs: {"aps":{"badge":2,<br/>"content-available":1}}
+
+    Note over iPad: iPad badge updates<br/>from 7 → 2 (silent)
+```
+
+### 8.2 Multi-Device Presence Aggregation
+
+Shows how presence is aggregated when a user has multiple devices with different states.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Desktop as Alice's Desktop
+    participant iPhone as Alice's iPhone
+    participant Notif07 as Notification Service<br/>(notif-07, Desktop)
+    participant Notif02 as Notification Service<br/>(notif-02, iPhone)
+    participant Redis as Redis/Valkey
+    participant FanOut as Fan-Out Service
+    participant Bob as Bob's Client
+
+    Note over Desktop,Notif07: Desktop goes idle (tab hidden)
+
+    Desktop->>Notif07: WS: {"type":"heartbeat",<br/>"state":"idle",<br/>"device_id":"dev_desktop_..."}
+
+    Notif07->>Redis: HSET conn:alice:dev_desktop_...<br/>client_state "idle"
+
+    Notif07->>Notif07: Aggregate presence for alice
+
+    Notif07->>Redis: KEYS conn:alice:*
+    Redis-->>Notif07: [conn:alice:dev_desktop_...,<br/>conn:alice:dev_ios_...]
+
+    Notif07->>Redis: HGET conn:alice:dev_desktop_... client_state
+    Redis-->>Notif07: "idle"
+
+    Notif07->>Redis: HGET conn:alice:dev_ios_... client_state
+    Redis-->>Notif07: "active"
+
+    Note over Notif07: MAX(idle, active) = active<br/>No presence change broadcast
+
+    Note over iPhone,Notif02: iPhone goes background (app minimized)
+
+    iPhone->>Notif02: WS: {"type":"heartbeat",<br/>"state":"background"}
+
+    Notif02->>Redis: HSET conn:alice:dev_ios_...<br/>client_state "background"
+
+    Notif02->>Notif02: Aggregate presence for alice
+
+    Notif02->>Redis: KEYS conn:alice:*
+    Notif02->>Redis: HGET conn:alice:dev_desktop_... client_state
+    Redis-->>Notif02: "idle"
+    Notif02->>Redis: HGET conn:alice:dev_ios_... client_state
+    Redis-->>Notif02: "background"
+
+    Note over Notif02: MAX(idle, background) = idle<br/>Presence changed: online → idle
+
+    Notif02->>Redis: HSET presence:alice<br/>status "idle" active_device_count 2
+
+    Notif02->>Redis: PUBLISH presence.changed.alice<br/>{status: "idle"}
+
+    FanOut->>Redis: Receives presence change
+    FanOut->>FanOut: Find channels where alice<br/>has online watchers
+    FanOut->>Bob: Route via instance inbox:<br/>{"type":"presence.update",<br/>"user":"alice", "status":"idle"}
+```
+
+### 8.3 Push Notification Deduplication
+
+Shows how push notifications are deduplicated when a user is active on any device.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sender as Bob (sender)
+    participant CmdSvc as Command Service
+    participant NATS as NATS JetStream
+    participant FanOut as Fan-Out Service
+    participant Notif07 as Notification Service<br/>(notif-07)
+    participant Desktop as Alice's Desktop<br/>(active)
+    participant PushEval as Push Evaluator
+    participant Redis as Redis/Valkey
+    participant iPhone as Alice's iPhone<br/>(background)
+
+    Sender->>CmdSvc: POST /chat.sendMessage<br/>{channel: "dm_bob_alice",<br/>text: "@alice check this"}
+
+    CmdSvc->>NATS: Publish messages.send.dm_bob_alice
+
+    par Real-time delivery
+        NATS->>FanOut: Fetch message event
+        FanOut->>Notif07: instance.events.notif-07
+        Notif07->>Desktop: WS: {"type":"message.new",...}
+        Note over Desktop: Alice sees message<br/>immediately on desktop
+    end
+
+    par Push notification evaluation
+        NATS->>PushEval: Fetch message event
+        PushEval->>PushEval: Target: alice (mentioned)
+
+        Note over PushEval,Redis: Check if alice is active
+
+        PushEval->>Redis: KEYS conn:alice:*
+        Redis-->>PushEval: [conn:alice:dev_desktop_...,<br/>conn:alice:dev_ios_...]
+
+        loop Check each device state
+            PushEval->>Redis: HGETALL conn:alice:dev_desktop_...
+            Redis-->>PushEval: {client_state: "active",<br/>focused_channel: "dm_bob_alice"}
+        end
+
+        Note over PushEval: Alice is ACTIVE on desktop<br/>AND viewing the DM channel<br/>→ SKIP push notification
+
+        PushEval->>PushEval: Log: push_skipped<br/>reason: "user_active_on_channel"
+    end
+
+    Note over iPhone: No push notification<br/>(Alice already saw it)
+```
+
+### 8.4 Notification Coalescing
+
+Shows how multiple rapid messages are coalesced into a single notification.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Bob as Bob (sender)
+    participant NATS as NATS JetStream
+    participant PushEval as Push Evaluator
+    participant Redis as Redis/Valkey
+    participant Scheduler as Delayed Scheduler
+    participant PushWorker as Push Worker
+    participant APNs as APNs
+    participant iPhone as Alice's iPhone
+
+    Note over Bob: Bob sends 3 messages<br/>in quick succession
+
+    Bob->>NATS: Message 1: "Hey"
+    Bob->>NATS: Message 2: "Are you there?"
+    Bob->>NATS: Message 3: "Need to talk about the project"
+
+    NATS->>PushEval: Message 1 event
+
+    PushEval->>Redis: INCR push-coalesce:alice:ch_general
+    Redis-->>PushEval: 1 (first message)
+
+    PushEval->>Redis: EXPIRE push-coalesce:alice:ch_general 5
+    PushEval->>Scheduler: Schedule push in 5 seconds
+
+    NATS->>PushEval: Message 2 event
+
+    PushEval->>Redis: INCR push-coalesce:alice:ch_general
+    Redis-->>PushEval: 2
+
+    Note over PushEval: Window exists, just increment
+
+    NATS->>PushEval: Message 3 event
+
+    PushEval->>Redis: INCR push-coalesce:alice:ch_general
+    Redis-->>PushEval: 3
+
+    Note over Scheduler: 5 seconds elapsed...
+
+    Scheduler->>PushWorker: Trigger coalesced push<br/>{user: alice, channel: ch_general}
+
+    PushWorker->>Redis: GET push-coalesce:alice:ch_general
+    Redis-->>PushWorker: 3
+
+    PushWorker->>Redis: DEL push-coalesce:alice:ch_general
+
+    Note over PushWorker: count > 1 → summary notification
+
+    PushWorker->>APNs: {"aps":{"alert":{<br/>"title":"#general",<br/>"body":"3 new messages from Bob"}}}
+
+    APNs->>iPhone: Single notification
+
+    Note over iPhone: Alice sees ONE notification<br/>"3 new messages from Bob"<br/>instead of 3 separate ones
+```
+
+### 8.5 Draft Synchronization
+
+Shows how message drafts sync between devices.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Desktop as Alice's Desktop
+    participant Notif07 as Notification Service<br/>(notif-07)
+    participant Redis as Redis/Valkey
+    participant NATS as NATS Core
+    participant Notif02 as Notification Service<br/>(notif-02)
+    participant iPhone as Alice's iPhone
+
+    Note over Desktop: Alice starts typing<br/>a long message on desktop
+
+    Desktop->>Desktop: Debounce 2 seconds...
+
+    Desktop->>Notif07: WS: {"type":"draft.save",<br/>"channel_id":"ch_general",<br/>"text":"Hey team, I've been thinking...",<br/>"reply_to":"msg_123"}
+
+    Notif07->>Redis: HSET draft:alice:ch_general<br/>{text: "Hey team...",<br/>reply_to: "msg_123",<br/>updated_at: "...",<br/>device_id: "dev_desktop_..."}
+
+    Notif07->>Redis: EXPIRE draft:alice:ch_general 604800
+    Note right of Redis: 7-day TTL
+
+    Notif07->>NATS: Publish user.sync.alice<br/>{type: "draft_sync",<br/>channel_id: "ch_general",<br/>draft: {...},<br/>source_device: "dev_desktop_..."}
+
+    NATS->>Notif02: Deliver sync event
+
+    Notif02->>Notif02: Find local connections for alice<br/>→ [ws_iphone]
+
+    Notif02->>iPhone: WS: {"type":"sync.draft",<br/>"channel_id":"ch_general",<br/>"draft":{...}}
+
+    Note over iPhone: iPhone shows draft indicator<br/>in #general channel
+
+    Note over iPhone: Alice opens #general on iPhone
+
+    iPhone->>Notif02: WS: {"type":"channel.open",<br/>"channel_id":"ch_general"}
+
+    Notif02->>Redis: HGETALL draft:alice:ch_general
+    Redis-->>Notif02: {text: "Hey team...",<br/>reply_to: "msg_123", ...}
+
+    Notif02->>iPhone: WS: {"type":"draft.load",<br/>"channel_id":"ch_general",<br/>"draft":{...}}
+
+    Note over iPhone: Compose box populated<br/>with draft from desktop
+```
+
+### Multi-Device Sync Summary
+
+| Flow | Trigger | Sync Mechanism | Latency |
+|------|---------|---------------|---------|
+| Read state sync | User reads on any device | Core NATS `user.sync.{user_id}` | < 100ms |
+| Badge update | Unread count changes | Silent push (APNs/FCM) | < 2s |
+| Presence aggregation | Device state changes | Redis + `presence.changed` | < 500ms |
+| Push deduplication | New message for offline user | Redis active device check | N/A |
+| Notification coalescing | Rapid messages | Redis counter + delayed scheduler | 5s window |
+| Draft sync | User saves draft | Core NATS `user.sync.{user_id}` | < 100ms |
