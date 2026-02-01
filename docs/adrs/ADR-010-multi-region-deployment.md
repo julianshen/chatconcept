@@ -124,6 +124,7 @@ The cross-region latency penalty (~100-150ms) is acceptable given the complexity
 **Negative:**
 
 - Primary region (US-East) is a single point of failure for writes
+- **Isolated regions cannot send/receive messages** — all writes require primary region connectivity
 - Cross-region events incur gateway hop latency
 - Redis write amplification (all presence updates go to primary)
 - Regional infrastructure cost (3x clusters, replicas)
@@ -134,6 +135,45 @@ The cross-region latency penalty (~100-150ms) is acceptable given the complexity
 - JetStream provides durability during brief gateway outages
 - Consider multi-primary Redis (Valkey) for presence in future
 - Start with 2 regions (US-East + EU), add Asia based on user distribution
+
+## Future Consideration: Regional Autonomy
+
+The current design prioritizes **consistency over availability**. If regional autonomy during network partitions becomes a requirement, the architecture can evolve to support **same-region chat during isolation**:
+
+### Required Changes
+
+| Component | Current | Regional Autonomy |
+|-----------|---------|-------------------|
+| Command Service | Primary region only | Deploy in each region |
+| Fan-Out Service | Primary region only | Deploy in each region |
+| NATS Streams | Global streams | Regional streams (`MESSAGES_{region}`) with cross-region mirroring |
+| Message IDs | Centralized | Region-prefixed (`msg_us_...`, `msg_eu_...`) |
+| Routing Table | Global (~2GB) | Regional subset (~900MB) + remote user index |
+
+### Recovery Mechanism
+
+When connectivity restores after a partition:
+
+1. **NATS mirrors sync automatically** — JetStream mirrors catch up with source streams
+2. **Fan-Out Services process missed events** — Each region processes events from other regions' mirrors
+3. **Clients see interleaved messages** — Ordered by timestamp, not arrival order
+4. **Presence state reconciled** — Regional Fan-Out Services exchange online user lists
+
+### Trade-off
+
+| Aspect | Current Design | With Regional Autonomy |
+|--------|----------------|------------------------|
+| Same-region chat during partition | :x: No | :white_check_mark: Yes |
+| Message ordering | Strict global | Eventually consistent |
+| Conflict resolution | Not needed | Last-Write-Wins |
+| Complexity | Lower | Higher |
+
+**Recommendation:** Implement regional autonomy only if:
+- >30% of users are in non-primary regions
+- Network partitions are not rare
+- Availability is prioritized over strict consistency
+
+See [Multi-Region Feature Documentation](../features/multi-region.md#10-future-enhancement-regional-autonomy) for detailed design.
 
 ## Related ADRs
 

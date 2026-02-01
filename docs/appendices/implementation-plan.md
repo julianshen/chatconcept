@@ -21,6 +21,7 @@ This document outlines the phased implementation approach for the Communication 
 | **5: Migration & Cutover** | Data migration from MongoDB messages to Cassandra. Dual-write period. Shadow traffic testing. Gradual client cutover. Migrate existing Rocket.Chat integrations to incoming/outgoing webhook model. | 3–4 weeks | Phases 1–4 | High |
 | **6: Decommission** | Remove Meteor.js oplog tailing. Remove message collections from MongoDB. Optimize and tune. | 1–2 weeks | Phase 5 stable | Low |
 | **7: Multi-Region** | Deploy NATS super-cluster with gateway links. Set up regional Cassandra DCs, Redis replicas, MongoDB secondaries. Deploy regional Notification and Query Services. Configure GeoDNS routing. | 4–6 weeks | Phase 6 stable | High |
+| **8: Regional Autonomy** *(Optional)* | Deploy regional Command and Fan-Out Services. Implement regional NATS streams with cross-region mirroring. Add event reconciliation and conflict resolution. | 4–6 weeks | Phase 7 stable | Very High |
 
 ---
 
@@ -259,6 +260,85 @@ This document outlines the phased implementation approach for the Communication 
 
 ---
 
+### Phase 8: Regional Autonomy (4-6 weeks) — *Optional*
+
+**Prerequisites:**
+- Phase 7 fully operational and stable
+- Business requirement for same-region chat during network partitions
+- Team experienced with distributed systems and conflict resolution
+
+**Objectives:**
+- Enable same-region messaging during network partitions
+- Implement event reconciliation after partition recovery
+- Maintain eventual consistency across regions
+
+**Sub-phases:**
+
+#### Phase 8.1: Regional Command & Fan-Out Services (2 weeks)
+
+**Deliverables:**
+- [ ] Command Service deployed in EU-West and Asia
+- [ ] Fan-Out Service deployed in EU-West and Asia
+- [ ] Regional routing tables implemented (~900MB per region)
+- [ ] Remote user index for cross-region routing
+- [ ] Health checks detect partition and switch to autonomous mode
+
+**Success Criteria:**
+- Regional Command Service accepts writes when primary unreachable
+- Regional Fan-Out Service routes to local Notification Services
+- Autonomous mode activates within 10 seconds of partition detection
+
+#### Phase 8.2: Regional NATS Streams (2 weeks)
+
+**Deliverables:**
+- [ ] Regional JetStream streams created (`MESSAGES_US`, `MESSAGES_EU`, `MESSAGES_AP`)
+- [ ] Cross-region stream mirroring configured
+- [ ] Region-prefixed message ID generation (`msg_{region}_{ulid}`)
+- [ ] Subject hierarchy updated with region prefix
+- [ ] Mirror lag monitoring and alerting
+
+**Success Criteria:**
+- Events published to regional streams
+- Mirrors sync within 5 minutes of partition recovery
+- No message ID collisions during partitions
+
+#### Phase 8.3: Event Reconciliation & Conflict Resolution (1-2 weeks)
+
+**Deliverables:**
+- [ ] Fan-Out Services consume from mirror streams after reconnection
+- [ ] Presence sync protocol between regional Fan-Out Services
+- [ ] Last-Write-Wins conflict resolution for edits/deletes
+- [ ] Client SDK handles out-of-order message arrival
+- [ ] Reconciliation progress monitoring
+
+**Success Criteria:**
+- All missed events delivered within 5 minutes of reconnection
+- Presence state consistent within 1 minute of reconnection
+- Conflicts resolved deterministically (LWW by timestamp)
+
+#### Phase 8.4: Validation & Chaos Testing (1 week)
+
+**Deliverables:**
+- [ ] Chaos testing: simulate 30-minute regional partition
+- [ ] Verify same-region chat works during partition
+- [ ] Verify reconciliation after partition recovery
+- [ ] Runbooks for regional autonomy operations
+- [ ] Monitoring dashboards for partition detection and recovery
+
+**Success Criteria:**
+- Same-region message delivery <50ms during partition
+- All messages reconciled after 30-minute partition within 5 minutes
+- No data loss or duplicate messages after reconciliation
+- Operations team trained on autonomous mode procedures
+
+**Risk Mitigation:**
+- Feature flag to disable regional autonomy and fall back to global mode
+- Extensive chaos testing before production enablement
+- Start with single secondary region (EU), add others after validation
+- Clear rollback procedure to Phase 7 architecture
+
+---
+
 ## Rollout Strategy
 
 ### 1. Shadow Mode
@@ -316,3 +396,4 @@ Gateway routing can switch back to Meteor.js instantly:
 | **M6: Production Cutover** | End of Phase 5 | 100% traffic on new system |
 | **M7: Legacy Decommissioned** | End of Phase 6 | Clean architecture |
 | **M8: Multi-Region Live** | End of Phase 7 | Global edge deployment, <50ms same-region latency |
+| **M9: Regional Autonomy** *(Optional)* | End of Phase 8 | Same-region chat during partitions, event reconciliation |

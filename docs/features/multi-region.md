@@ -17,6 +17,7 @@
 7. [Latency Optimization Patterns](#7-latency-optimization-patterns)
 8. [Failure Scenarios and Recovery](#8-failure-scenarios-and-recovery)
 9. [Deployment Checklist](#9-deployment-checklist)
+10. [Future Enhancement: Regional Autonomy](#10-future-enhancement-regional-autonomy)
 
 ---
 
@@ -557,9 +558,372 @@ CASSANDRA_FALLBACK_CONSISTENCY: "ONE"  # Cross-DC fallback
 
 ---
 
+## 10. Future Enhancement: Regional Autonomy
+
+The current design prioritizes **consistency over availability**: all writes go through the primary region, so an isolated region cannot send messages. This section describes an optional enhancement to enable **same-region chat during network partitions**.
+
+### 10.1 Current Limitation
+
+When a region is isolated from the primary region:
+
+```
+Current Behavior During EU Isolation:
+
+┌─────────────────────────────────────────────────────────────────┐
+│  US-East (Primary)              ║  EU-West (Isolated)           │
+│                                 ║                               │
+│  ┌─────────────────┐           ║  ┌─────────────────┐          │
+│  │ Command Service │ ◄─────────╬──┤ API Gateway     │ ✗ FAILS  │
+│  └─────────────────┘           ║  └─────────────────┘          │
+│                                 ║                               │
+│  ┌─────────────────┐           ║  ┌─────────────────┐          │
+│  │ Fan-Out Service │ ──────────╬─►│ Notif Service   │ ✗ NO DATA│
+│  └─────────────────┘           ║  └─────────────────┘          │
+└─────────────────────────────────────────────────────────────────┘
+
+EU Users Experience:
+✗ Cannot send messages (Command Service unreachable)
+✗ Cannot receive new messages (Fan-Out Service unreachable)
+✓ Can query message history (local Cassandra replica - stale)
+✓ Can see cached presence (local Redis replica - stale)
+```
+
+### 10.2 Regional Autonomy Architecture
+
+To enable same-region chat during isolation, deploy **Regional Command and Fan-Out Services**:
+
+```
+Regional Autonomy Architecture:
+
+┌─────────────────────────────────────────────────────────────────┐
+│  US-East (Primary)              ║  EU-West (Autonomous)         │
+│                                 ║                               │
+│  ┌─────────────────┐           ║  ┌─────────────────┐          │
+│  │ Command Service │           ║  │ Command Service │ ✓ LOCAL  │
+│  └────────┬────────┘           ║  └────────┬────────┘          │
+│           ▼                     ║           ▼                   │
+│  ┌─────────────────┐           ║  ┌─────────────────┐          │
+│  │ Regional NATS   │◄══════════╬══►│ Regional NATS   │          │
+│  │ JetStream       │  Gateway  ║  │ JetStream       │          │
+│  │ MESSAGES_US     │  Links    ║  │ MESSAGES_EU     │          │
+│  └────────┬────────┘           ║  └────────┬────────┘          │
+│           ▼                     ║           ▼                   │
+│  ┌─────────────────┐           ║  ┌─────────────────┐          │
+│  │ Fan-Out Service │           ║  │ Fan-Out Service │ ✓ LOCAL  │
+│  │ (US routing)    │           ║  │ (EU routing)    │          │
+│  └────────┬────────┘           ║  └────────┬────────┘          │
+│           ▼                     ║           ▼                   │
+│  ┌─────────────────┐           ║  ┌─────────────────┐          │
+│  │ Notif Services  │           ║  │ Notif Services  │          │
+│  └─────────────────┘           ║  └─────────────────┘          │
+└─────────────────────────────────────────────────────────────────┘
+
+During Isolation - EU Users Can:
+✓ Send messages to EU users and bots
+✓ Receive messages from EU users and bots
+✓ See EU user presence updates
+✗ Cannot reach US/Asia users (expected)
+```
+
+### 10.3 Key Design Changes
+
+#### Regional NATS Streams
+
+Each region maintains its own JetStream streams for locally-originated events:
+
+```hcl
+# US-East NATS configuration
+jetstream {
+  store_dir: "/data/jetstream"
+}
+
+# Regional stream for US-originated messages
+# nats stream add MESSAGES_US --subjects "messages.us.>" --replicas 3
+
+# Mirror of EU stream (populated when connected)
+# nats stream add MESSAGES_EU_MIRROR --mirror MESSAGES_EU --cluster eu-west
+```
+
+**Subject Hierarchy with Region Prefix:**
+
+```
+messages.{region}.send.{channel_id}      → MessageSent event
+messages.{region}.edit.{channel_id}      → MessageEdited event
+messages.{region}.delete.{channel_id}    → MessageDeleted event
+
+# Examples:
+messages.us.send.ch_general              → US-originated message
+messages.eu.send.ch_general              → EU-originated message
+```
+
+#### Region-Prefixed Message IDs
+
+To avoid ID collisions during partitions, message IDs include a region prefix:
+
+```json
+{
+  "message_id": "msg_us_01HZ3K4M5N6P7Q8R9S0T",
+  "region_origin": "us-east",
+  "channel_id": "ch_global",
+  "text": "Hello from US",
+  "timestamp": "2026-02-01T10:30:00.123Z"
+}
+```
+
+**ID Format:** `msg_{region}_{ulid}`
+
+- `region`: 2-letter region code (us, eu, ap)
+- `ulid`: Universally Unique Lexicographically Sortable Identifier
+
+#### Regional Routing Tables
+
+Each regional Fan-Out Service maintains a **regional routing table** for local users, plus a **remote user index** for cross-region routing:
+
+```go
+type RegionalFanOutService struct {
+    region          string
+    localRouting    *ChannelRouting  // Users connected to this region
+    remoteIndex     *RemoteUserIndex // Users in other regions (synced via gateway)
+
+    localStream     string           // e.g., "MESSAGES_US"
+    mirrorStreams   []string         // e.g., ["MESSAGES_EU_MIRROR", "MESSAGES_AP_MIRROR"]
+}
+
+type RemoteUserIndex struct {
+    mu      sync.RWMutex
+    regions map[string]*RegionEntry  // region → users
+}
+
+type RegionEntry struct {
+    Region    string
+    Users     map[string]string      // user_id → instance_id
+    LastSync  time.Time
+    Connected bool                    // false during partition
+}
+```
+
+**Memory Impact:**
+
+| Structure | Size (50K users, 3 regions) |
+|-----------|----------------------------|
+| Local Routing Table | ~700MB (regional subset) |
+| Remote User Index | ~100MB per remote region |
+| **Total per Region** | ~900MB (vs 2GB global) |
+
+### 10.4 Cross-Region Event Flow
+
+#### Normal Operation (Connected)
+
+```
+Alice (US) sends message to #global (US + EU members):
+
+1. Alice → US Command Service
+2. US Command Service → MESSAGES_US stream (messages.us.send.ch_global)
+3. US Fan-Out Service consumes event
+4. US Fan-Out routes to:
+   a. Local US Notification Services (direct)
+   b. EU Fan-Out Service via gateway (messages.us.send.ch_global)
+5. EU Fan-Out routes to EU Notification Services
+6. All users receive message
+```
+
+#### During Partition (Isolated)
+
+```
+Bob (EU) sends message to #eu-team (EU-only members):
+
+1. Bob → EU Command Service (local)
+2. EU Command Service → MESSAGES_EU stream (messages.eu.send.ch_eu-team)
+3. EU Fan-Out Service consumes event
+4. EU Fan-Out routes to EU Notification Services
+5. EU users receive message immediately
+
+Meanwhile in US:
+- US users don't see #eu-team activity (no EU members there anyway)
+- Gateway link down, events buffer in NATS
+```
+
+### 10.5 Recovery and Reconciliation
+
+When connectivity restores, the system reconciles divergent state:
+
+#### Phase 1: Gateway Link Reconnection
+
+```
+Timeline:
+T=0          T=30min        T=30:01        T=35min
+│            │              │              │
+▼            ▼              ▼              ▼
+Partition    Reconnect      Sync           Fully
+starts       detected       begins         synced
+
+Events During Partition:
+├── MESSAGES_US: msg_us_001 → msg_us_500 (500 events)
+├── MESSAGES_EU: msg_eu_001 → msg_eu_200 (200 events)
+└── Both regions operated independently
+```
+
+#### Phase 2: Stream Mirroring Catches Up
+
+NATS JetStream mirrors automatically sync when gateways reconnect:
+
+```bash
+# US-East receives EU events via mirror
+$ nats stream info MESSAGES_EU_MIRROR
+...
+Mirror Information:
+  Stream: MESSAGES_EU @ eu-west
+  Lag: 0           # Caught up after reconnection
+  Last Seen: 1s ago
+```
+
+#### Phase 3: Fan-Out Services Process Missed Events
+
+Each regional Fan-Out Service processes events from mirror streams:
+
+```go
+func (f *RegionalFanOutService) ProcessMirrorStream(stream string) {
+    // Resume from last processed sequence
+    consumer := f.nats.CreateConsumer(stream, nats.DeliverByStartSequence(f.lastSeq[stream]))
+
+    for msg := range consumer.Messages() {
+        event := parseEvent(msg)
+
+        // Route to local users who are members of this channel
+        if f.hasLocalMembers(event.ChannelID) {
+            f.routeToLocalInstances(event)
+        }
+
+        f.lastSeq[stream] = msg.Sequence
+        msg.Ack()
+    }
+}
+```
+
+#### Phase 4: Client Message Ordering
+
+Clients receive messages ordered by **timestamp**, interleaving events from all regions:
+
+```
+Channel: #global (US + EU members)
+
+Before Partition:
+10:00:00 [US] Alice: "Starting the meeting"
+
+During Partition (30 minutes):
+├── US users see only US messages
+└── EU users see only EU messages
+
+After Reconciliation:
+10:00:00 [US] Alice: "Starting the meeting"
+10:05:00 [US] Carol: "I'm here"
+10:05:30 [EU] Bob: "Joining from EU"        ← Appears after sync
+10:10:00 [EU] Dan: "Can you hear me?"       ← Appears after sync
+10:15:00 [US] Alice: "Let's wait for EU"
+10:20:00 [EU] Bob: "We're back online!"     ← Appears after sync
+10:25:00 [US] Carol: "Great, let's continue"
+```
+
+#### Phase 5: Presence Reconciliation
+
+Regional Fan-Out Services exchange presence state:
+
+```go
+type PresenceSyncMessage struct {
+    Region      string
+    OnlineUsers map[string]InstanceInfo  // user_id → instance info
+    Timestamp   time.Time
+}
+
+// On reconnection, each region broadcasts its presence state
+func (f *RegionalFanOutService) BroadcastPresence() {
+    sync := PresenceSyncMessage{
+        Region:      f.region,
+        OnlineUsers: f.localRouting.GetAllOnlineUsers(),
+        Timestamp:   time.Now(),
+    }
+    f.nats.Publish("presence.sync."+f.region, sync)
+}
+
+// Other regions merge the presence data
+func (f *RegionalFanOutService) HandlePresenceSync(sync PresenceSyncMessage) {
+    f.remoteIndex.Update(sync.Region, sync.OnlineUsers, sync.Timestamp)
+}
+```
+
+### 10.6 Conflict Resolution
+
+#### Message Edit Conflicts
+
+If the same message is edited in different regions during partition (rare edge case):
+
+```
+Scenario: Message msg_us_001 edited in both regions
+
+US-East (10:05:00): Edit to "Hello world!"
+EU-West (10:05:30): Edit to "Hello everyone!"
+
+Resolution: Last-Write-Wins (LWW) by timestamp
+Result: "Hello everyone!" (EU edit wins, later timestamp)
+```
+
+**Cassandra Implementation:**
+
+```sql
+-- Cassandra uses cell-level timestamps for LWW
+UPDATE messages
+SET body = 'Hello everyone!', edited_at = '2026-02-01T10:05:30Z'
+WHERE channel_id = 'ch_general'
+  AND bucket = '2026-02-01'
+  AND message_id = msg_us_001;
+
+-- Later timestamp wins automatically
+```
+
+#### Membership Conflicts
+
+If a user is added/removed from a channel in different regions:
+
+```
+Scenario: User Carol and channel #project
+
+US-East (10:05:00): Admin adds Carol to #project
+EU-West (10:05:30): Different admin removes Carol from #project
+
+Resolution: Last-Write-Wins
+Result: Carol is NOT in #project (removal wins, later timestamp)
+```
+
+### 10.7 Trade-offs Summary
+
+| Aspect | Current (Global) | Regional Autonomy |
+|--------|------------------|-------------------|
+| **Same-region chat during partition** | :x: No | :white_check_mark: Yes |
+| **Message ordering guarantee** | :white_check_mark: Strict global | :warning: Eventually consistent |
+| **Routing table size per region** | 2GB (global) | ~900MB (regional) |
+| **Conflict resolution** | Not needed | Last-Write-Wins |
+| **Implementation complexity** | Lower | Higher |
+| **Operational complexity** | Lower | Higher |
+| **Recovery time after partition** | Instant (no divergence) | Minutes (stream sync) |
+
+### 10.8 When to Implement Regional Autonomy
+
+**Recommended when:**
+- User base is heavily distributed across regions (>30% in non-primary regions)
+- Users frequently collaborate within regional teams
+- Availability is prioritized over strict consistency
+- Network partitions between regions are not rare
+
+**Not recommended when:**
+- Most users are in one region
+- Strict message ordering is critical (e.g., financial transactions)
+- Operational team is small or inexperienced with distributed systems
+
+---
+
 ## Related Documents
 
 - [ADR-010: Multi-Region Deployment](../adrs/ADR-010-multi-region-deployment.md) — Decision rationale
 - [Detailed Design](../detailed-design.md) — Service specifications
 - [Risks and Mitigations](../appendices/risks.md) — Cross-region failure risks
-- [Implementation Plan](../appendices/implementation-plan.md) — Phase 7: Multi-Region
+- [Implementation Plan](../appendices/implementation-plan.md) — Phase 7: Multi-Region, Phase 8: Regional Autonomy

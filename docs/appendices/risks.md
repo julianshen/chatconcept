@@ -27,6 +27,8 @@ This document catalogs identified risks and their mitigation strategies for the 
 | Regional NATS cluster failure | Low | High | Users in affected region cannot receive real-time updates; GeoDNS redirects to next-nearest region; automatic recovery via RAFT |
 | Cassandra cross-DC replication lag | Medium | Low | Regional reads may serve stale data (100-200ms lag); acceptable for message history; real-time updates via WebSocket are authoritative |
 | Primary region complete failure | Very Low | Critical | All writes fail; manual failover to secondary region required (15-30min RTO); regional read replicas continue serving queries |
+| Event reconciliation conflicts (Regional Autonomy) | Medium | Medium | Same message edited in multiple regions during partition; Last-Write-Wins resolution may surprise users; clear conflict indicators in UI |
+| Split-brain during partition recovery (Regional Autonomy) | Low | High | Brief window where regions disagree on state; NATS mirror sync and presence reconciliation resolve within minutes |
 
 ---
 
@@ -430,6 +432,62 @@ Likelihood │            │ complexity,   │             │
 
 ---
 
+### Event Reconciliation Conflicts (Regional Autonomy)
+
+**Risk:** During a network partition, the same message could be edited or deleted in multiple regions, leading to conflicting states.
+
+**Likelihood:** Medium — Increases with partition duration and channel activity.
+
+**Impact:** Medium — Users may see unexpected edit results; no data loss.
+
+**Mitigations:**
+1. Last-Write-Wins (LWW) resolution by timestamp
+2. UI indicators showing "edited during partition" or conflict marker
+3. Audit log preserves all versions for manual review if needed
+4. Deterministic resolution ensures all regions converge to same state
+5. Consider CRDTs for future enhancement if LWW is insufficient
+
+**Example Scenario:**
+```
+Message msg_us_001 during 30-minute partition:
+- US (10:05:00): Edit to "Hello world!"
+- EU (10:05:30): Edit to "Hello everyone!"
+Result: "Hello everyone!" wins (later timestamp)
+```
+
+---
+
+### Split-Brain During Partition Recovery (Regional Autonomy)
+
+**Risk:** Brief window after partition recovery where regions have inconsistent views of presence, messages, and channel membership.
+
+**Likelihood:** Low — Only occurs during recovery window.
+
+**Impact:** High — Users may temporarily see inconsistent state.
+
+**Mitigations:**
+1. NATS stream mirroring syncs automatically on reconnection
+2. Presence reconciliation protocol exchanges user lists
+3. Convergence typically within 1-5 minutes
+4. Client SDK handles out-of-order message delivery gracefully
+5. Clear "syncing" indicator in UI during reconciliation
+
+**Recovery Timeline:**
+```
+T=0:        Partition ends, gateway links reconnect
+T=0-30s:    NATS detects reconnection, starts mirror sync
+T=30s-2m:   Message streams synchronize (depending on volume)
+T=1-3m:     Presence reconciliation completes
+T=3-5m:     Full consistency restored
+```
+
+**Detection:**
+- Mirror lag metrics spike then decrease
+- Presence sync messages between regions
+- Client reconnection rate normalization
+
+---
+
 ## Updated Risk Assessment Matrix
 
 ```
@@ -447,16 +505,21 @@ Likelihood │            │               │ hotspot,    │
            │            │               │ Network     │
            │            │               │ partition,  │
            │            │               │ Regional    │
-           │            │               │ NATS fail   │
+           │            │               │ NATS fail,  │
+           │            │               │ Split-brain*│
 ───────────┼────────────┼───────────────┼─────────────┼────────────────
 Medium     │ Cassandra  │ GC pauses,    │ Webhook     │
 Likelihood │ replication│ Cold start,   │ SSRF        │
            │ lag        │ Consistency,  │             │
            │            │ Webhook       │             │
-           │            │ backlog       │             │
+           │            │ backlog,      │             │
+           │            │ Reconciliation│             │
+           │            │ conflicts*    │             │
 ───────────┼────────────┼───────────────┼─────────────┼────────────────
 High       │            │ Operational   │             │
 Likelihood │            │ complexity,   │             │
            │            │ Protocol      │             │
            │            │ migration     │             │
+
+* Regional Autonomy risks (Phase 8) — only applicable if implemented
 ```
