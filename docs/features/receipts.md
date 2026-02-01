@@ -90,10 +90,11 @@ When a user reads a message in a small group, the `receipts.read` event is fan-o
 
 ## 5. Aggregate Last-Read Pointer (Large Channels)
 
-### NATS KV Bucket: `read-pointers`
+### Redis Key: `read-pointer:{user_id}:{channel_id}`
 
 ```
-Key: user/{user_id}/channel/{channel_id}
+Key: read-pointer:{user_id}:{channel_id}
+Type: Hash
 Value: {
   "last_read_id": "msg_01HZ4L...",
   "last_read_at": "2026-02-01T10:35:00Z"
@@ -104,8 +105,8 @@ TTL: none (persistent)
 ### Write Path
 
 - When a user opens a channel or scrolls to the bottom, the client sends: `{"type": "mark_read", "channel_id": "ch_general", "message_id": "msg_01HZ4L..."}`
-- The Notification Service updates the NATS KV pointer. No Cassandra write needed.
-- Write volume: one KV update per "channel open" event per user — approximately **600 updates/sec** at 100K online users
+- The Notification Service updates the Redis pointer. No Cassandra write needed.
+- Write volume: one Redis HSET per "channel open" event per user — approximately **600 updates/sec** at 100K online users
 
 **No per-message "read by" UI** for large channels. The UI only shows "X has read up to here" or unread counts.
 

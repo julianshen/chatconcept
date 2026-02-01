@@ -65,7 +65,7 @@ C4Container
 
         Container(querySvc, "Query Service", "Go", "Serves all REST read endpoints: message history from Cassandra, metadata from MongoDB, search from Elasticsearch. Cursor-based pagination.")
 
-        Container(fanoutSvc, "Fan-Out Service", "Go", "Core routing engine. Maintains in-memory channel-to-instance routing table (~2GB). Consumes channel events from JetStream, publishes to Notification Service instance inboxes via Core NATS. Watches NATS KV for presence changes.")
+        Container(fanoutSvc, "Fan-Out Service", "Go", "Core routing engine. Maintains in-memory channel-to-instance routing table (~2GB). Consumes channel events from JetStream, publishes to Notification Service instance inboxes via Core NATS. Subscribes to Redis pub/sub for presence changes.")
 
         Container(notifSvc, "Notification Service", "Go", "Manages WebSocket connections. Subscribes NATS subjects. Routes events to local WebSocket connections via in-memory channel-to-connection map.")
 
@@ -75,7 +75,9 @@ C4Container
         Container(pushWorker, "Push Worker Pool", "Go, Pull Consumer", "Durable pull consumer on NOTIFICATIONS stream. Delivers push notifications via APNs and FCM.")
         Container(webhookWorker, "Webhook Dispatcher Pool (Bot Platform)", "Go, Pull Consumer", "Durable pull consumer on WEBHOOKS stream. Matches events to registered webhook subscriptions. Delivers outgoing HTTP POST with HMAC-SHA256 signature. Exponential backoff retry (up to 5 attempts). Logs delivery results to Cassandra.")
 
-        ContainerDb(nats, "NATS JetStream + Core NATS", "NATS Server Cluster", "Event backbone. JetStream streams: MESSAGES, META, NOTIFICATIONS, WEBHOOKS, SYSTEM. Core pub/sub: instance inboxes, typing indicators. KV Store: presence, typing, permissions cache, instance registry.")
+        ContainerDb(nats, "NATS JetStream + Core NATS", "NATS Server Cluster", "Event backbone. JetStream streams: MESSAGES, META, NOTIFICATIONS, WEBHOOKS, SYSTEM. Core pub/sub: instance inboxes, typing indicators.")
+
+        ContainerDb(redisCluster, "Redis/Valkey", "Redis Cluster", "Ephemeral state: presence, typing, permissions cache, instance registry, read pointers.")
 
         ContainerDb(cassandra, "Apache Cassandra", "Cassandra 4.x", "Message history + webhook delivery log. Partitioned by (channel_id, daily_bucket) for messages, by (webhook_id, daily_bucket) for delivery log. TWCS compaction.")
 
@@ -155,13 +157,13 @@ C4Component
 
         Component(outboundPub, "Outbound Publisher", "NATS Core connection", "Publishes client-originated events (typing start/stop) to Core NATS subject client.typing.{channel_id}. The Fan-Out Service picks these up and redistributes to other instances.")
 
-        Component(presencePub, "Presence Publisher", "NATS KV client", "On user connect: PUT presence/user/{user_id} = {status:online, instance_id:notif-07}. On disconnect: PUT status:offline. TTL=120s ensures auto-cleanup if instance crashes.")
+        Component(presencePub, "Presence Publisher", "Redis client", "On user connect: HSET presence:user:{user_id} + PUBLISH presence:changes. On disconnect: Update status to offline. TTL=120s ensures auto-cleanup if instance crashes.")
     }
 
     Person(users, "Connected Users", "10K–50K WebSocket connections")
     Container(fanout, "Fan-Out Service", "Go", "Routes events to this instance inbox")
     ContainerDb(natsCore, "NATS Core Pub/Sub", "", "instance.events.notif-07 + client.typing.{ch}")
-    ContainerDb(natsKV, "NATS KV Store", "", "Presence bucket")
+    ContainerDb(redis, "Redis/Valkey", "", "Presence, read pointers, caches")
     ContainerDb(mongo, "MongoDB (cached)", "", "Channel memberships for connecting users")
 
     Rel(users, wsManager, "WebSocket frames (JSON)", "wss://")
@@ -180,7 +182,7 @@ C4Component
     Rel(eventDispatcher, localRouter, "RLock + lookup channel_id → connections", "in-memory, <1μs")
     Rel(eventDispatcher, users, "WebSocket write: serialized JSON event", "wss://")
 
-    Rel(presencePub, natsKV, "PUT presence/user/{user_id}", "KV with TTL=120s")
+    Rel(presencePub, redis, "HSET presence:user:{user_id}", "Redis with TTL=120s")
 
     UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
 ```
@@ -195,7 +197,7 @@ C4Component
 | Local Routing Table | Channel-to-connection mapping |
 | Instance Inbox Subscriber | Single NATS subscription |
 | Event Dispatcher | Fan-out to WebSocket connections |
-| Presence Publisher | Online/offline status to KV |
+| Presence Publisher | Online/offline status to Redis |
 
 ---
 
@@ -213,7 +215,7 @@ C4Component
 
         Component(memberConsumer, "Membership Consumer", "Go goroutine pool + NATS pull subscription", "Durable pull consumer 'fan-out-meta' on META stream, filter: channels.member.>. Processes MemberJoined and MemberLeft events. Updates routing table for online users only.")
 
-        Component(presenceWatcher, "Presence Watcher", "Go goroutine + NATS KV Watch", "Watches NATS KV bucket 'presence' with Watch(\"user/>\"). On user online: loads channel memberships, populates routing table. On user offline or TTL expiry: evicts user from routing table.")
+        Component(presenceWatcher, "Presence Watcher", "Go goroutine + Redis pub/sub", "Subscribes to Redis channel 'presence:changes'. On user online: loads channel memberships, populates routing table. On user offline or TTL expiry: evicts user from routing table.")
 
         Component(channelIndex, "Channel → Instance Index", "Go map[string]map[string]*InstanceEntry + sync.RWMutex", "Primary routing structure. Maps channel_id → {instance_id → Set<user_id>}. Read path is lock-free under RWMutex (concurrent reads). Write path acquires write lock (rare, <1% of operations).")
 
@@ -227,14 +229,14 @@ C4Component
     }
 
     ContainerDb(natsJS, "NATS JetStream", "", "MESSAGES + META streams")
-    ContainerDb(natsKV, "NATS KV Store", "", "Presence bucket (TTL=120s)")
+    ContainerDb(redis, "Redis/Valkey", "", "Presence data + pub/sub (TTL=120s)")
     ContainerDb(natsPubSub, "NATS Core Pub/Sub", "", "Instance inbox subjects + typing subjects")
     ContainerDb(mongo, "MongoDB", "", "Channel memberships collection")
     Container(notifSvc, "Notification Service Instances", "Go", "Receives pre-routed events on instance inbox")
 
     Rel(natsJS, eventConsumer, "Pull consume: messages.>", "JetStream")
     Rel(natsJS, memberConsumer, "Pull consume: channels.member.>", "JetStream")
-    Rel(natsKV, presenceWatcher, "Watch: user/>", "KV watcher callback")
+    Rel(redis, presenceWatcher, "SUBSCRIBE presence:changes", "Redis pub/sub")
 
     Rel(eventConsumer, channelIndex, "RLock + lookup channel_id", "in-memory, <1μs")
     Rel(eventConsumer, instancePublisher, "Publish to N instance inboxes", "")

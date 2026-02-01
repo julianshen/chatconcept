@@ -16,7 +16,7 @@ This document catalogs identified risks and their mitigation strategies for the 
 | NATS JetStream data loss (cluster failure) | Very Low | Critical | R=3 replication; regular stream snapshots; Cassandra backups are the long-term source of truth |
 | Cassandra partition hotspot (viral channel) | Low | High | Daily time-bucketed partitions; further sub-partitioning for extreme channels |
 | Cassandra GC pause spikes | Medium | Medium | Use G1GC/ZGC, appropriate heap sizing (8–16GB), monitor with JMX metrics, consider Cassandra 5.x with Trie-based memtables |
-| Fan-Out Service routing table corruption | Low | High | Table is ephemeral and fully reconstructable from NATS KV + MongoDB. Kill and restart to rebuild. |
+| Fan-Out Service routing table corruption | Low | High | Table is ephemeral and fully reconstructable from Redis + MongoDB. Kill and restart to rebuild. |
 | Fan-Out Service cold start delay | Medium | Medium | 30–60s reconstruction time during which events buffer in JetStream. Pre-warm standby instances. |
 | Eventual consistency confuses clients | Medium | Medium | Real-time notifications mask the gap; client library handles optimistic UI updates; REST catchup on reconnect |
 | Operational complexity increase | High | Medium | Strong observability; runbooks; phased rollout allows team learning |
@@ -106,7 +106,7 @@ This document catalogs identified risks and their mitigation strategies for the 
 
 **Mitigations:**
 1. Routing table is fully ephemeral and reconstructable
-2. Simple restart rebuilds from NATS KV + MongoDB
+2. Simple restart rebuilds from Redis + MongoDB
 3. Periodic consistency checks comparing table to source data
 4. Multiple Fan-Out workers provide redundancy
 
@@ -119,7 +119,7 @@ This document catalogs identified risks and their mitigation strategies for the 
 ```bash
 # Restart affected Fan-Out worker
 kubectl rollout restart deployment/fan-out-service
-# Worker rebuilds routing table from KV + MongoDB (~60s)
+# Worker rebuilds routing table from Redis + MongoDB (~60s)
 ```
 
 ---

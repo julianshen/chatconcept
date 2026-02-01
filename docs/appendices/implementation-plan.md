@@ -96,7 +96,7 @@ This document outlines the phased implementation approach for the Communication 
 
 **Deliverables:**
 - [ ] Fan-Out Service with routing table
-- [ ] Presence watcher (NATS KV)
+- [ ] Presence watcher (Redis pub/sub)
 - [ ] Membership consumer
 - [ ] Notification Service with WebSocket manager
 - [ ] Local routing table

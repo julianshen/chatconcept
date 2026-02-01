@@ -42,7 +42,7 @@ Hybrid approach: per-message receipts for channels ≤50 members, aggregate last
 Four-tier catchup strategy based on gap duration:
 - < 2 min: JetStream replay
 - 2 min - 1 hr: Cassandra active channels
-- 1 hr - 24 hr: NATS KV unread counts
+- 1 hr - 24 hr: Redis unread counts
 - \> 24 hr: Full REST refresh
 
 ---

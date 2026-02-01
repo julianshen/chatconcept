@@ -182,7 +182,7 @@ graph TB
 
     subgraph EventBus["Event Backbone"]
         NATS["NATS JetStream<br/>[Clustered, R=3]"]
-        NATSKV["NATS KV Store<br/>Presence, Typing,<br/>Routing Metadata"]
+        Redis["Redis/Valkey<br/>Presence, Typing,<br/>Routing Metadata"]
     end
 
     subgraph FanOut["Fan-Out Layer"]
@@ -218,7 +218,7 @@ graph TB
     GW -->|"WebSocket"| NotifSvc
 
     CmdSvc -->|"Publish Events"| NATS
-    CmdSvc -->|"Read/Write State"| NATSKV
+    CmdSvc -->|"Read/Write State"| Redis
 
     NATS --> FanOutSvc
     NATS --> MsgWriter
@@ -260,7 +260,7 @@ graph TB
 | Store | Purpose | Data |
 |-------|---------|------|
 | **NATS JetStream** | Event backbone, durable streaming | All domain events with 30-day retention |
-| **NATS KV** | Ephemeral state | Presence, typing indicators, routing metadata, permissions cache |
+| **Redis/Valkey** | Ephemeral state | Presence, typing indicators, routing metadata, permissions cache |
 | **Apache Cassandra** | Message history | Messages partitioned by (channel_id, daily_bucket) |
 | **MongoDB** | Metadata | Users, channels, permissions, settings, webhook registrations |
 | **Elasticsearch** | Full-text search | Message content index with daily ILM |

@@ -23,7 +23,7 @@
    - [Webhook Dispatcher Worker](#25-webhook-dispatcher-worker)
 3. [Webhook System Design](#3-webhook-system-design)
 4. [NATS JetStream Topology](#4-nats-jetstream-topology)
-5. [NATS KV Store Usage](#5-nats-kv-store-usage)
+5. [Redis/Valkey Usage](#5-redisvalkey-usage)
 6. [Subscription & Fan-Out Architecture](#6-subscription--fan-out-architecture)
 7. [Event Replay and State Reconstruction](#7-event-replay-and-state-reconstruction)
 8. [Technical Considerations](#8-technical-considerations)
@@ -128,7 +128,7 @@ webhooks.outgoing.{channel_id}     → WebhookTrigger event
   - User/channel metadata → MongoDB
   - Full-text search → Elasticsearch
 - Implement cursor-based pagination for message history (using `message_id` as the cursor)
-- Cache frequently accessed data (channel membership lists, user profiles) using NATS KV Store or a local TTL cache
+- Cache frequently accessed data (channel membership lists, user profiles) using Redis/Valkey or a local TTL cache
 
 **API Compatibility:** The Query Service implements existing REST API endpoints (e.g., `/api/v1/channels.history`, `/api/v1/channels.list`, `/api/v1/users.info`). Clients do not need to change their REST usage.
 
@@ -183,7 +183,7 @@ Consumer: fan-out-meta
 3. Subscribe to a **single NATS Core subject**: `instance.events.{self.instance_id}`
 4. On receiving an event from the Fan-Out Service via the instance inbox, route it to the appropriate local WebSocket connections based on channel membership
 5. Handle outbound client events (typing indicators, etc.) by publishing to NATS for the Fan-Out Service to redistribute
-6. Publish presence changes (user online/offline) to NATS KV on connect/disconnect
+6. Publish presence changes (user online/offline) to Redis on connect/disconnect
 
 **Critical difference from traditional design:** The Notification Service does NOT subscribe to per-channel NATS subjects. It subscribes to exactly ONE subject — its own instance inbox.
 
@@ -463,21 +463,30 @@ The Webhook Dispatcher tracks consecutive failures per webhook. If a webhook rea
 
 ---
 
-## 5. NATS KV Store Usage
+## 5. Redis/Valkey Usage
 
-| Bucket | Key Pattern | Value | TTL | Purpose |
-|--------|-------------|-------|-----|---------|
-| `presence` | `user/{user_id}` | `{"status":"online","instance_id":"notif-07"}` | 120s | User online/offline status |
-| `typing` | `channel/{channel_id}/{user_id}` | `{"typing": true}` | 5s | Typing indicator (auto-expires) |
-| `permissions-cache` | `channel/{channel_id}` | `{"roles": {...}, "members_count": N}` | 300s | Cached permission data |
-| `rate-limits` | `user/{user_id}/msg` | `{"count": 42, "window_start": "..."}` | 60s | Per-user rate limiting |
-| `rate-limits` | `webhook/{webhook_id}/min` | `{"count": 42, "window_start": "..."}` | 60s | Per-webhook rate limiting |
-| `instance-registry` | `instance/{instance_id}` | `{"address": "10.0.1.7", "connections": 8421}` | 30s | Notification Service discovery |
-| `webhook-channels` | `channel/{channel_id}` | `{"webhook_ids": ["whk_01HZ..."]}` | 300s | Channels with active webhooks |
-| `read-pointers` | `user/{user_id}/channel/{channel_id}` | `{"last_read_id": "...", "last_read_at": "..."}` | none | Per-user per-channel read position |
-| `channel-latest` | `channel/{channel_id}` | `{"latest_id": "...", "latest_at": "...", "message_seq": N}` | none | Most recent message per channel |
-| `thread-read-pointers` | `user/{user_id}/thread/{thread_id}` | `{"last_read_id": "...", "last_read_at": "..."}` | 30 days | Per-user per-thread read position |
-| `client-state` | `user/{user_id}/session` | `{"last_event_seq": N, "instance_id": "...", "active_channels": [...]}` | 24 hours | Client reconnection state |
+Redis (or Valkey, the open-source fork) provides ephemeral state storage with TTL support and pub/sub for real-time change notifications.
+
+| Key Pattern | Type | Value | TTL | Purpose |
+|-------------|------|-------|-----|---------|
+| `presence:user:{user_id}` | Hash | `{status:"online", instance_id:"notif-07"}` | 120s | User online/offline status |
+| `typing:{channel_id}:{user_id}` | String | `1` | 5s | Typing indicator (auto-expires) |
+| `permissions:{channel_id}` | Hash | `{roles:..., members_count:N}` | 300s | Cached permission data |
+| `ratelimit:user:{user_id}:msg` | String | count | 60s | Per-user rate limiting (INCR + EXPIRE) |
+| `ratelimit:webhook:{webhook_id}` | String | count | 60s | Per-webhook rate limiting |
+| `instance:{instance_id}` | Hash | `{address:"10.0.1.7", connections:8421}` | 30s | Notification Service discovery |
+| `webhook:channels:{channel_id}` | Set | webhook_ids | 300s | Channels with active webhooks |
+| `read-pointer:{user_id}:{channel_id}` | Hash | `{last_read_id:..., last_read_at:...}` | none | Per-user per-channel read position |
+| `channel-latest:{channel_id}` | Hash | `{latest_id:..., latest_at:..., message_seq:N}` | none | Most recent message per channel |
+| `thread-read:{user_id}:{thread_id}` | Hash | `{last_read_id:..., last_read_at:...}` | 30 days | Per-user per-thread read position |
+| `client-state:{user_id}` | Hash | `{last_event_seq:N, instance_id:..., active_channels:[...]}` | 24 hours | Client reconnection state |
+
+### Pub/Sub Channels
+
+| Channel | Publisher | Subscriber | Purpose |
+|---------|-----------|------------|---------|
+| `presence:changes` | Notification Service | Fan-Out Service | User online/offline notifications |
+| `typing:changes:{channel_id}` | Notification Service | Fan-Out Service | Typing indicator broadcasts |
 
 ---
 
@@ -640,7 +649,7 @@ Consumer: recovery-replay
 
 ### 7.3 Fan-Out Service Recovery
 
-The routing table is entirely ephemeral and reconstructable from NATS KV (presence) + MongoDB (memberships). No persistent state needs to be backed up.
+The routing table is entirely ephemeral and reconstructable from Redis (presence) + MongoDB (memberships). No persistent state needs to be backed up.
 
 ---
 

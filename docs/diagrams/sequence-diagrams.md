@@ -30,7 +30,7 @@ sequenceDiagram
     Gateway->>CmdSvc: Forward request
 
     CmdSvc->>CmdSvc: Validate payload schema
-    CmdSvc->>CmdSvc: Check authorization<br/>(cached permissions from NATS KV)
+    CmdSvc->>CmdSvc: Check authorization<br/>(cached permissions from Redis)
     CmdSvc->>CmdSvc: Generate event_id, message_id
 
     CmdSvc->>NATS: Publish to<br/>messages.send.ch_general<br/>(with Nats-Msg-Id for dedup)
@@ -73,7 +73,7 @@ sequenceDiagram
     autonumber
     participant Client as Client (Alice)
     participant NotifSvc as Notification Service<br/>(Instance notif-07)
-    participant NATSKV as NATS KV Store
+    participant Redis as Redis/Valkey
     participant FanOut as Fan-Out Service
     participant MongoDB as MongoDB
 
@@ -86,12 +86,14 @@ sequenceDiagram
 
     NotifSvc->>NotifSvc: Build local routing table:<br/>for each channel_id, add alice's WS conn
 
-    NotifSvc->>NATSKV: PUT presence/user/alice<br/>{"status":"online",<br/>"instance_id":"notif-07"}
+    NotifSvc->>Redis: HSET presence:user:alice<br/>status "online" instance "notif-07"
+    NotifSvc->>Redis: EXPIRE presence:user:alice 120
+    NotifSvc->>Redis: PUBLISH presence:changes alice:online
 
     NotifSvc-->>Client: {"type":"auth.ok",<br/>"user_id":"usr_alice",<br/>"session_id":"sess_01HZ..."}
 
-    Note over NATSKV,FanOut: Routing Table Update
-    FanOut->>NATSKV: Watch("user/>") receives change
+    Note over Redis,FanOut: Routing Table Update
+    FanOut->>Redis: SUBSCRIBE presence:changes<br/>receives alice:online
     FanOut->>FanOut: Load alice's channel memberships<br/>(from internal cache or MongoDB)
     FanOut->>FanOut: For each of alice's 100K channels:<br/>add notif-07 to routing table entry
 
@@ -100,8 +102,9 @@ sequenceDiagram
     Note over Client,NotifSvc: Disconnection
     Client->>NotifSvc: WebSocket Close
     NotifSvc->>NotifSvc: Remove alice from local routing table
-    NotifSvc->>NATSKV: PUT presence/user/alice<br/>{"status":"offline",<br/>"last_seen":"2026-02-01T11:00:00Z"}
-    FanOut->>NATSKV: Watch receives offline event
+    NotifSvc->>Redis: HSET presence:user:alice<br/>status "offline" last_seen "2026-02-01T11:00:00Z"
+    NotifSvc->>Redis: PUBLISH presence:changes alice:offline
+    FanOut->>Redis: Receives alice:offline via subscription
     FanOut->>FanOut: Remove alice from routing table<br/>(evict notif-07 from channels<br/>where alice was the only user<br/>on that instance)
 ```
 
@@ -109,7 +112,7 @@ sequenceDiagram
 
 1. **Zero per-channel subscriptions:** 100K memberships = zero NATS subscriptions created
 2. **In-memory routing update:** ~5-10ms for 100K channel insertions
-3. **Graceful crash handling:** KV TTL (120s) auto-expires stale presence
+3. **Graceful crash handling:** Redis TTL (120s) auto-expires stale presence
 
 ---
 
@@ -205,7 +208,7 @@ sequenceDiagram
     autonumber
     participant Client
     participant NotifSvc as Notification Service
-    participant NATSKV as NATS KV
+    participant Redis as Redis/Valkey
     participant NATSJS as NATS JetStream
     participant QuerySvc as Query Service
     participant Cassandra as Cassandra
@@ -218,14 +221,14 @@ sequenceDiagram
         NATSJS-->>NotifSvc: Replay ~200-2000 events
         NotifSvc->>Client: Stream missed events via WebSocket
     else Tier 2: Gap 2min - 1hr
-        NotifSvc->>NATSKV: GET client-state/{user_id}
-        NATSKV-->>NotifSvc: {active_channels: [top 50]}
+        NotifSvc->>Redis: HGETALL client-state:{user_id}
+        Redis-->>NotifSvc: {active_channels: [top 50]}
         NotifSvc->>Cassandra: Query messages for active channels<br/>(parallel, ~50 queries)
         Cassandra-->>NotifSvc: Recent messages
         NotifSvc->>Client: Catchup payload + unread counts
     else Tier 3: Gap 1hr - 24hr
-        NotifSvc->>NATSKV: Batch GET read-pointer/* + channel-latest/*
-        NATSKV-->>NotifSvc: Pointers for all channels
+        NotifSvc->>Redis: MGET read-pointer:* + channel-latest:*
+        Redis-->>NotifSvc: Pointers for all channels
         NotifSvc->>NotifSvc: Compute unread counts only
         NotifSvc->>Client: Unread counts (no messages)
         Note right of Client: Client fetches messages<br/>via REST on channel open
@@ -242,7 +245,7 @@ sequenceDiagram
 |------|-------------|-------------|---------|
 | 1 | < 2 min | JetStream replay | < 1s |
 | 2 | 2 min - 1 hr | Cassandra (active channels) | ~500ms |
-| 3 | 1 hr - 24 hr | NATS KV (unread only) | < 100ms |
+| 3 | 1 hr - 24 hr | Redis (unread only) | < 100ms |
 | 4 | > 24 hr | Full REST refresh | Varies |
 
 ---
@@ -260,7 +263,7 @@ sequenceDiagram
     participant NATS as NATS JetStream
     participant ReceiptWriter as Receipt Writer
     participant Cassandra as Cassandra
-    participant NATSKV as NATS KV
+    participant Redis as Redis/Valkey
     participant OtherClient as Bob (sender)
 
     Client->>NotifSvc: WS: {"type":"message.read",<br/>"channel_id":"ch_dm_alice_bob",<br/>"message_id":"msg_456"}
@@ -278,8 +281,8 @@ sequenceDiagram
         NATS->>NotifSvc: Fan-out: receipt.read event
         NotifSvc->>OtherClient: WS: {"type":"receipt.read",<br/>"message_id":"msg_456",<br/>"read_by":["alice"]}
     else Large channel (>50 members)
-        CmdSvc->>NATSKV: PUT read-pointer/alice/ch_large<br/>{"last_read":"msg_789"}
-        Note right of NATSKV: No per-message receipt stored.<br/>No real-time fan-out.
+        CmdSvc->>Redis: HSET read-pointer:alice:ch_large<br/>last_read "msg_789"
+        Note right of Redis: No per-message receipt stored.<br/>No real-time fan-out.
     end
 ```
 
@@ -350,15 +353,18 @@ Shows how the Fan-Out Service updates its routing table when users come online o
 ```mermaid
 sequenceDiagram
     autonumber
-    participant NATSKV as NATS KV Store<br/>(presence bucket)
-    participant Watcher as Presence Watcher<br/>(KV Watch callback)
+    participant Redis as Redis/Valkey<br/>(presence data + pub/sub)
+    participant Watcher as Presence Watcher<br/>(pub/sub subscriber)
     participant Cache as Membership Cache<br/>(LRU, TTL=5min)
     participant MongoDB as MongoDB
     participant ChannelIdx as Channel → Instance Index
     participant UserIdx as User → Channels Index
 
-    Note over NATSKV,Watcher: User Comes Online
-    NATSKV->>Watcher: Watch callback: PUT user/alice<br/>{status:online, instance:notif-07}
+    Note over Redis,Watcher: User Comes Online
+    Redis->>Watcher: SUBSCRIBE presence:changes<br/>receives "alice:online:notif-07"
+
+    Watcher->>Redis: HGETALL presence:user:alice
+    Redis-->>Watcher: {status:online, instance:notif-07}
 
     Watcher->>Cache: Get(user_id="alice")
     alt Cache hit
@@ -383,8 +389,8 @@ sequenceDiagram
 
     Note over Watcher: ~5-10ms for 100K channels<br/>(in-memory map operations)
 
-    Note over NATSKV,Watcher: User Goes Offline
-    NATSKV->>Watcher: Watch callback: PUT user/alice<br/>{status:offline} or DELETE (TTL expiry)
+    Note over Redis,Watcher: User Goes Offline
+    Redis->>Watcher: Receives "alice:offline"<br/>via pub/sub (or TTL expiry notification)
 
     Watcher->>UserIdx: RLock()
     Watcher->>UserIdx: Get(user_id="alice")

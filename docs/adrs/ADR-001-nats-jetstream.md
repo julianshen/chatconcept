@@ -23,6 +23,8 @@ Use **NATS JetStream** as the primary event bus and message persistence layer.
 | **Consumer groups** | ✅ Pull consumers share work automatically; no partitioning required | ✅ But requires partition management | ✅ Competing consumers |
 | **Lightweight pub/sub** | ✅ Core NATS — zero overhead, no persistence | ❌ All topics are persistent | ⚠️ More overhead |
 | **KV Store** | ✅ Built-in with TTL, watchers, history | ❌ Requires external system | ❌ Requires external system |
+
+> **Note:** While NATS provides a built-in KV Store, we use Redis/Valkey for ephemeral state management (presence, typing, routing metadata) due to its richer data structures and broader operational familiarity.
 | **Exactly-once delivery** | ✅ Publisher dedup + double-ack | ✅ Idempotent producer + transactions | ⚠️ At-least-once |
 | **Operational complexity** | Low — single binary | High — ZooKeeper/KRaft | Medium — Erlang runtime |
 | **Scaling without partitions** | ✅ Pull consumers scale horizontally | ❌ Requires repartitioning | ✅ But queue-based |
@@ -35,7 +37,7 @@ Use **NATS JetStream** as the primary event bus and message persistence layer.
 
 2. **Dual-mode messaging:** NATS provides both persistent streaming (JetStream) and ephemeral pub/sub (Core NATS) in the same system. Typing indicators use ephemeral pub/sub with zero persistence overhead.
 
-3. **Built-in KV Store:** The NATS KV Store provides a distributed key-value store with TTL and watchers — eliminating the need for a separate Redis deployment.
+3. **Operational simplicity:** While NATS provides a built-in KV Store, we leverage Redis/Valkey for ephemeral state to take advantage of its richer data structures (hashes, sets, sorted sets) and the team's existing operational expertise.
 
 4. **Operational simplicity:** NATS is a single Go binary. A 3-node JetStream cluster is straightforward compared to Kafka's multi-component ecosystem.
 

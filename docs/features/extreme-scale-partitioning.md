@@ -146,24 +146,21 @@ func channelPartition(channelID string, numPartitions int) int {
 
 ## 5. Partition Registry
 
-### NATS KV Bucket: `partition-registry`
+### Redis Key: `partition-registry`
 
 ```
-Key:    config/current
+Key:    partition-registry:config
+Type:   Hash
 Value:  {
-  "num_partitions": 256,
-  "assignments": {
-    "worker-0": [0, 1, 2, ..., 31],
-    "worker-1": [32, 33, ..., 63],
-    ...
-  },
-  "version": 7,
+  "num_partitions": "256",
+  "assignments": "{\"worker-0\": [0, 1, 2, ..., 31], \"worker-1\": [32, 33, ..., 63], ...}",
+  "version": "7",
   "updated_at": "2026-02-01T12:00:00Z"
 }
 TTL: none (persistent)
 ```
 
-**Updated by:** An operator or auto-scaler when workers are added/removed. Workers watch this key and react to changes.
+**Updated by:** An operator or auto-scaler when workers are added/removed. Workers subscribe to Redis pub/sub channel `partition:changes` and react to changes.
 
 ---
 
@@ -172,8 +169,8 @@ TTL: none (persistent)
 When a worker is added or removed:
 
 ```
-1. Operator/auto-scaler updates partition-registry
-2. All workers receive KV watch notification
+1. Operator/auto-scaler updates partition-registry in Redis
+2. All workers receive notification via Redis pub/sub
 3. Workers that LOST partitions:
    - Stop accepting events for lost partitions
    - Evict routing entries for channels in lost partitions
@@ -205,7 +202,7 @@ When a worker is added or removed:
      Replicas: 1
    ```
    This gives a 5-minute buffer for worker recovery or rebalancing.
-3. Auto-scaler detects the crash (via NATS KV heartbeat expiry)
+3. Auto-scaler detects the crash (via Redis key TTL expiry)
 4. Option A: Restart the crashed worker (K8s will do this automatically)
 5. Option B: Redistribute partitions to surviving workers
 

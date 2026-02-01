@@ -31,54 +31,51 @@
 
 ## 2. Data Model
 
-### NATS KV Bucket: `read-pointers`
+### Redis Key: `read-pointer:{user_id}:{channel_id}`
 
 The primary data structure for unread computation:
 
 ```
-Bucket: read-pointers
-Key:    user/{user_id}/channel/{channel_id}
+Key:    read-pointer:{user_id}:{channel_id}
+Type:   Hash
 Value:  {
   "last_read_id": "msg_01HZ4L...",
   "last_read_at": "2026-02-01T10:35:00Z"
 }
 TTL: none (persistent)
-History: 1
 ```
 
-### NATS KV Bucket: `channel-latest`
+### Redis Key: `channel-latest:{channel_id}`
 
 Tracks the most recent message in each channel:
 
 ```
-Bucket: channel-latest
-Key:    channel/{channel_id}
+Key:    channel-latest:{channel_id}
+Type:   Hash
 Value:  {
   "latest_id": "msg_01HZ5M...",
   "latest_at": "2026-02-01T10:40:00Z",
   "latest_sender": "usr_carol",
   "latest_preview": "Has anyone seen the...",
-  "message_seq": 142857
+  "message_seq": "142857"
 }
 TTL: none (persistent)
-History: 1
 ```
 
-**Updated by:** The Message Writer Worker, after writing each message to Cassandra, also updates the `channel-latest` KV entry.
+**Updated by:** The Message Writer Worker, after writing each message to Cassandra, also updates the `channel-latest` Redis key.
 
-### NATS KV Bucket: `thread-read-pointers`
+### Redis Key: `thread-read:{user_id}:{thread_id}`
 
 Separate read pointers for thread-level unread:
 
 ```
-Bucket: thread-read-pointers
-Key:    user/{user_id}/thread/{thread_id}
+Key:    thread-read:{user_id}:{thread_id}
+Type:   Hash
 Value:  {
   "last_read_id": "msg_01HZ4R...",
   "last_read_at": "2026-02-01T10:36:00Z"
 }
-TTL: 30 days
-History: 1
+TTL: 30 days (EXPIRE)
 ```
 
 ---
@@ -89,18 +86,18 @@ History: 1
 
 ```go
 func hasUnread(userID, channelID string) bool {
-    readPointer, _ := kv.Get("read-pointers", "user/"+userID+"/channel/"+channelID)
-    channelLatest, _ := kv.Get("channel-latest", "channel/"+channelID)
+    readPointer, _ := redis.HGetAll("read-pointer:" + userID + ":" + channelID)
+    channelLatest, _ := redis.HGetAll("channel-latest:" + channelID)
 
-    if readPointer == nil {
-        return channelLatest != nil  // never read → unread if any messages exist
+    if len(readPointer) == 0 {
+        return len(channelLatest) > 0  // never read → unread if any messages exist
     }
 
-    return channelLatest.LatestID > readPointer.LastReadID
+    return channelLatest["latest_id"] > readPointer["last_read_id"]
 }
 ```
 
-**Cost:** 2 NATS KV reads — sub-millisecond.
+**Cost:** 2 Redis HGETALL commands — sub-millisecond.
 
 ### Unread Count (badge number)
 
@@ -202,7 +199,7 @@ func bulkUnreadSync(userID string, channelIDs []string) []UnreadStatus {
 }
 ```
 
-**Performance:** For a user in 100K channels, this requires ~100K KV reads + comparisons. NATS KV bulk reads can process ~100K keys in 200–500ms. Acceptable for a login operation.
+**Performance:** For a user in 100K channels, this requires ~100K Redis reads + comparisons. Redis MGET can process ~100K keys in 200–500ms. Acceptable for a login operation.
 
 ---
 
@@ -210,7 +207,7 @@ func bulkUnreadSync(userID string, channelIDs []string) []UnreadStatus {
 
 Thread unread follows the same pattern:
 
-1. `thread-read-pointers` KV tracks last-read position per thread per user
+1. `thread-read:{user_id}:{thread_id}` Redis key tracks last-read position per thread per user
 2. When a thread reply arrives, compare with the user's thread read pointer
 3. Show unread badge on the thread root in the channel timeline
 4. Show unread count in the "Threads" panel
@@ -223,8 +220,8 @@ Thread unread follows the same pattern:
 
 When a user reads a channel on Device A, Device B should reflect this:
 
-1. Device A sends `mark_read` → Notification Service updates `read-pointers` KV
-2. The KV watcher on each Notification Service instance detects the change
+1. Device A sends `mark_read` → Notification Service updates `read-pointer:*` in Redis
+2. The Notification Service publishes to Redis pub/sub channel `read-pointer:changes`
 3. If the user is connected on another instance (Device B), that instance pushes:
    ```json
    {
@@ -236,4 +233,4 @@ When a user reads a channel on Device A, Device B should reflect this:
    ```
 4. Device B's client resets its local unread count for that channel
 
-**Implementation:** The Notification Service subscribes to NATS KV watches for its connected users' read pointers. When a change is detected from a different instance (compare `instance_id`), it relays the update.
+**Implementation:** The Notification Service subscribes to Redis pub/sub channel `read-pointer:changes`. When a change is detected from a different instance (compare `instance_id`), it relays the update to local clients.

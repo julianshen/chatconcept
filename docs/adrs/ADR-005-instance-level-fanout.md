@@ -35,7 +35,7 @@ Each Notification Service instance subscribes to exactly **one** NATS subject â€
 
 ### Memory Trade-off
 
-The Fan-Out Service maintains an in-memory routing table (~2GB at 100K online users). This fits comfortably in a modern server's memory and is fully reconstructable from NATS KV + MongoDB.
+The Fan-Out Service maintains an in-memory routing table (~2GB at 100K online users). This fits comfortably in a modern server's memory and is fully reconstructable from Redis + MongoDB.
 
 ## Consequences
 

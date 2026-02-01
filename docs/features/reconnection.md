@@ -30,18 +30,19 @@ A user with 100K channel memberships cannot receive full catchup data for all ch
 
 ## 2. Server-Side State
 
-### NATS KV Bucket: `client-state`
+### Redis Key: `client-state:{user_id}`
 
 ```
-Key: user/{user_id}/session
+Key: client-state:{user_id}
+Type: Hash
 Value: {
-  "last_event_seq": 123456789,       // JetStream sequence of last event delivered
+  "last_event_seq": "123456789",       // JetStream sequence of last event delivered
   "last_delivered_at": "2026-02-01T10:30:00Z",
-  "instance_id": "notif-07",         // which Notification Service instance was serving them
-  "active_channels": ["ch_general", "ch_dev", ...],  // top 50 recently active channels
-  "active_threads": ["msg_01HZ3K...", ...]  // threads with recent activity
+  "instance_id": "notif-07",           // which Notification Service instance was serving them
+  "active_channels": "[\"ch_general\", \"ch_dev\", ...]",  // JSON array of top 50 recently active channels
+  "active_threads": "[\"msg_01HZ3K...\", ...]"  // JSON array of threads with recent activity
 }
-TTL: 24 hours
+TTL: 24 hours (EXPIRE)
 ```
 
 **Written by:** Notification Service — updates `last_event_seq` periodically (every 5 seconds or every 100 events) and on clean disconnect.
@@ -85,7 +86,7 @@ The reconnection protocol uses a tiered approach based on disconnection duration
 
 ### Tier 3 — Long Gap (1 hour – 24 hours)
 
-- **Source:** NATS KV (`channel-latest` + `read-pointers` buckets)
+- **Source:** Redis (`channel-latest:*` + `read-pointer:*` keys)
 - **Method:** Compute unread status per channel by comparing read pointers with channel latest
 - **Delivery:**
   ```json
@@ -96,7 +97,7 @@ The reconnection protocol uses a tiered approach based on disconnection duration
   ]}
   ```
 - **Client behavior:** Shows unread indicators. Fetches actual messages via REST when user opens a channel.
-- **Cost:** NATS KV bulk read — sub-millisecond per key
+- **Cost:** Redis MGET — sub-millisecond per key
 
 ### Tier 4 — Very Long Gap (> 24 hours)
 
@@ -151,7 +152,7 @@ sequenceDiagram
     autonumber
     participant Client as Client (Alice)
     participant NotifSvc as Notification Svc<br/>(new instance notif-12)
-    participant NATSKV as NATS KV
+    participant Redis as Redis/Valkey
     participant Cassandra as Cassandra
     participant FanOut as Fan-Out Service
 
@@ -159,16 +160,17 @@ sequenceDiagram
     Client->>NotifSvc: WebSocket Connect + Auth Token
     NotifSvc->>NotifSvc: Validate JWT → user_id = alice
 
-    NotifSvc->>NATSKV: GET client-state/user/alice/session
-    NATSKV-->>NotifSvc: {last_event_seq: 123456789,<br/>last_delivered_at: T-5min,<br/>active_channels: [ch_general, ch_dev, ...]}
+    NotifSvc->>Redis: HGETALL client-state:alice
+    Redis-->>NotifSvc: {last_event_seq: 123456789,<br/>last_delivered_at: T-5min,<br/>active_channels: [ch_general, ch_dev, ...]}
 
     NotifSvc->>NotifSvc: Compute gap = 5 min → Tier 2
 
     NotifSvc-->>Client: {"type": "sync.plan", "tier": 2,<br/>"gap_seconds": 300, "active_channels_count": 47}
 
     par Load channel memberships + build local routing
-        NotifSvc->>NATSKV: GET presence data
-        NotifSvc->>NATSKV: PUT presence/user/alice → {instance: notif-12}
+        NotifSvc->>Redis: HGETALL presence:user:alice
+        NotifSvc->>Redis: HSET presence:user:alice instance notif-12
+        NotifSvc->>Redis: PUBLISH presence:changes alice:online:notif-12
     end
 
     par Query active channels for missed messages
@@ -182,7 +184,7 @@ sequenceDiagram
     NotifSvc-->>Client: {"type": "sync.batch", "channel_id": "ch_dev", ...}
 
     par Compute unread for non-active channels
-        NotifSvc->>NATSKV: Bulk GET read-pointers + channel-latest
+        NotifSvc->>Redis: MGET read-pointer:* + channel-latest:*
         NotifSvc->>NotifSvc: Compare → compute unread flags
     end
 

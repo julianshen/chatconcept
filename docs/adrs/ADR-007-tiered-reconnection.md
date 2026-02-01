@@ -28,7 +28,7 @@ The key insight is that reconnection cost should be **proportional to the discon
 |------|-------------|-------------|------|
 | **1** | < 2 min | JetStream replay | No DB query, sub-second |
 | **2** | 2 min – 1 hr | Cassandra (active channels only) | ~50 parallel queries |
-| **3** | 1 hr – 24 hr | NATS KV (unread counts only) | KV reads only |
+| **3** | 1 hr – 24 hr | Redis (unread counts only) | Redis reads only |
 | **4** | > 24 hr | Full refresh via REST | Load on demand |
 
 ### Tier 1: Short Gap (< 2 minutes)

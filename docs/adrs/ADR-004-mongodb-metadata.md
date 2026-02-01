@@ -30,7 +30,7 @@ Message history moves to Cassandra.
 | Messages | Cassandra | Write-optimized, time-series partitioning |
 | Users, Channels, Permissions | MongoDB | Flexible schema, rich queries |
 | Search Index | Elasticsearch | Full-text indexing |
-| Ephemeral State | NATS KV | Presence, typing, routing metadata |
+| Ephemeral State | Redis/Valkey | Presence, typing, routing metadata |
 
 ### Operational Simplicity
 
