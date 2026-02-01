@@ -290,3 +290,239 @@ sequenceDiagram
 | DM | 2 | Per-message | Yes |
 | Small group | ≤50 | Per-message | Yes |
 | Large channel | >50 | Pointer only | No |
+
+---
+
+## 7. Fan-Out Service Internal Flow
+
+Detailed view of how the Fan-Out Service processes events internally, showing all components working together.
+
+### 7.1 Message Event Processing
+
+Shows the internal flow when a channel message arrives for fan-out.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant NATSJS as NATS JetStream<br/>(MESSAGES stream)
+    participant EventConsumer as Event Consumer<br/>(goroutine pool)
+    participant ChannelIdx as Channel → Instance Index<br/>(map + RWMutex)
+    participant UserIdx as User → Channels Index<br/>(map + RWMutex)
+    participant Publisher as Instance Publisher<br/>(batched flush)
+    participant NATSCore as NATS Core Pub/Sub
+
+    Note over NATSJS,EventConsumer: Pull Consumer Loop
+    EventConsumer->>NATSJS: Fetch(batch=200, timeout=5s)
+    NATSJS-->>EventConsumer: [event_1, event_2, ... event_200]
+
+    loop For each event in batch
+        EventConsumer->>EventConsumer: Parse event, extract channel_id
+
+        Note over EventConsumer,ChannelIdx: Routing Table Lookup (read path)
+        EventConsumer->>ChannelIdx: RLock()
+        EventConsumer->>ChannelIdx: Get(channel_id="ch_general")
+        ChannelIdx-->>EventConsumer: {notif-01: [alice, bob],<br/>notif-07: [carol],<br/>notif-12: [dave, eve]}
+        EventConsumer->>ChannelIdx: RUnlock()
+
+        Note over EventConsumer,Publisher: Prepare instance publishes
+        EventConsumer->>EventConsumer: Build target list:<br/>[notif-01, notif-07, notif-12]
+        EventConsumer->>EventConsumer: Serialize event once<br/>(not per-instance)
+
+        EventConsumer->>Publisher: Enqueue(notif-01, event_bytes)
+        EventConsumer->>Publisher: Enqueue(notif-07, event_bytes)
+        EventConsumer->>Publisher: Enqueue(notif-12, event_bytes)
+    end
+
+    Note over Publisher,NATSCore: Batched Publish
+    Publisher->>Publisher: Flush batch (every 1ms or 100 events)
+    Publisher->>NATSCore: Publish instance.events.notif-01
+    Publisher->>NATSCore: Publish instance.events.notif-07
+    Publisher->>NATSCore: Publish instance.events.notif-12
+
+    Note over EventConsumer,NATSJS: Acknowledge batch
+    EventConsumer->>NATSJS: +ACK (batch of 200)
+```
+
+### 7.2 Presence Change Processing
+
+Shows how the Fan-Out Service updates its routing table when users come online or go offline.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant NATSKV as NATS KV Store<br/>(presence bucket)
+    participant Watcher as Presence Watcher<br/>(KV Watch callback)
+    participant Cache as Membership Cache<br/>(LRU, TTL=5min)
+    participant MongoDB as MongoDB
+    participant ChannelIdx as Channel → Instance Index
+    participant UserIdx as User → Channels Index
+
+    Note over NATSKV,Watcher: User Comes Online
+    NATSKV->>Watcher: Watch callback: PUT user/alice<br/>{status:online, instance:notif-07}
+
+    Watcher->>Cache: Get(user_id="alice")
+    alt Cache hit
+        Cache-->>Watcher: [ch_general, ch_dev, ... 99,998 more]
+    else Cache miss
+        Watcher->>MongoDB: db.memberships.find({user_id:"alice"})
+        MongoDB-->>Watcher: [ch_general, ch_dev, ... 99,998 more]
+        Watcher->>Cache: Put(alice, channels, TTL=5min)
+    end
+
+    Note over Watcher,UserIdx: Update routing tables (write path)
+    Watcher->>ChannelIdx: WLock()
+    Watcher->>UserIdx: WLock()
+
+    loop For each channel in alice's memberships
+        Watcher->>ChannelIdx: AddUserToChannel(ch_general, notif-07, alice)
+        Watcher->>UserIdx: AddChannelToUser(alice, ch_general)
+    end
+
+    Watcher->>UserIdx: WUnlock()
+    Watcher->>ChannelIdx: WUnlock()
+
+    Note over Watcher: ~5-10ms for 100K channels<br/>(in-memory map operations)
+
+    Note over NATSKV,Watcher: User Goes Offline
+    NATSKV->>Watcher: Watch callback: PUT user/alice<br/>{status:offline} or DELETE (TTL expiry)
+
+    Watcher->>UserIdx: RLock()
+    Watcher->>UserIdx: Get(user_id="alice")
+    UserIdx-->>Watcher: {instance:notif-07,<br/>channels:[ch_general, ch_dev, ...]}
+    Watcher->>UserIdx: RUnlock()
+
+    Note over Watcher,ChannelIdx: Evict user from all channels
+    Watcher->>ChannelIdx: WLock()
+    Watcher->>UserIdx: WLock()
+
+    loop For each channel in alice's cached entry
+        Watcher->>ChannelIdx: RemoveUserFromChannel(ch_general, notif-07, alice)
+        Note over ChannelIdx: If notif-07 has no more users<br/>in ch_general, remove instance entry
+    end
+
+    Watcher->>UserIdx: Delete(alice)
+    Watcher->>UserIdx: WUnlock()
+    Watcher->>ChannelIdx: WUnlock()
+```
+
+### 7.3 Membership Change Processing
+
+Shows how the Fan-Out Service handles channel join/leave events.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant NATSJS as NATS JetStream<br/>(META stream)
+    participant MemberConsumer as Membership Consumer<br/>(filter: channels.member.>)
+    participant ChannelIdx as Channel → Instance Index
+    participant UserIdx as User → Channels Index
+    participant Cache as Membership Cache
+
+    Note over NATSJS,MemberConsumer: Member Joined Event
+    MemberConsumer->>NATSJS: Fetch(filter="channels.member.joined.>")
+    NATSJS-->>MemberConsumer: {type:member_joined,<br/>channel:ch_general, user:alice}
+
+    MemberConsumer->>UserIdx: RLock()
+    MemberConsumer->>UserIdx: Get(user_id="alice")
+    alt User is online
+        UserIdx-->>MemberConsumer: {instance:notif-07, channels:[...]}
+        MemberConsumer->>UserIdx: RUnlock()
+
+        Note over MemberConsumer,ChannelIdx: Update routing (user is online)
+        MemberConsumer->>ChannelIdx: WLock()
+        MemberConsumer->>UserIdx: WLock()
+        MemberConsumer->>ChannelIdx: AddUserToChannel(ch_general, notif-07, alice)
+        MemberConsumer->>UserIdx: AddChannelToUser(alice, ch_general)
+        MemberConsumer->>UserIdx: WUnlock()
+        MemberConsumer->>ChannelIdx: WUnlock()
+
+        MemberConsumer->>Cache: Invalidate(alice)
+    else User is offline
+        UserIdx-->>MemberConsumer: nil (not found)
+        MemberConsumer->>UserIdx: RUnlock()
+        Note over MemberConsumer: No routing update needed<br/>(user not receiving events anyway)
+        MemberConsumer->>Cache: Invalidate(alice)
+    end
+
+    MemberConsumer->>NATSJS: +ACK
+
+    Note over NATSJS,MemberConsumer: Member Left Event
+    NATSJS-->>MemberConsumer: {type:member_left,<br/>channel:ch_dev, user:bob}
+
+    MemberConsumer->>UserIdx: RLock()
+    MemberConsumer->>UserIdx: Get(user_id="bob")
+    alt User is online
+        UserIdx-->>MemberConsumer: {instance:notif-03, channels:[...]}
+        MemberConsumer->>UserIdx: RUnlock()
+
+        MemberConsumer->>ChannelIdx: WLock()
+        MemberConsumer->>UserIdx: WLock()
+        MemberConsumer->>ChannelIdx: RemoveUserFromChannel(ch_dev, notif-03, bob)
+        MemberConsumer->>UserIdx: RemoveChannelFromUser(bob, ch_dev)
+        MemberConsumer->>UserIdx: WUnlock()
+        MemberConsumer->>ChannelIdx: WUnlock()
+
+        MemberConsumer->>Cache: Invalidate(bob)
+    else User is offline
+        MemberConsumer->>UserIdx: RUnlock()
+        MemberConsumer->>Cache: Invalidate(bob)
+    end
+
+    MemberConsumer->>NATSJS: +ACK
+```
+
+### 7.4 Typing Indicator Routing
+
+Shows how ephemeral typing events are routed through the Fan-Out Service.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant NATSCore as NATS Core Pub/Sub
+    participant TypingHandler as Typing Handler<br/>(subscription: client.typing.>)
+    participant ChannelIdx as Channel → Instance Index
+    participant Publisher as Instance Publisher
+
+    Note over NATSCore,TypingHandler: Receive typing event
+    NATSCore->>TypingHandler: Deliver: client.typing.ch_general<br/>{user:alice, instance:notif-07, typing:true}
+
+    TypingHandler->>TypingHandler: Extract channel_id, origin_instance
+
+    Note over TypingHandler,ChannelIdx: Lookup target instances
+    TypingHandler->>ChannelIdx: RLock()
+    TypingHandler->>ChannelIdx: Get(channel_id="ch_general")
+    ChannelIdx-->>TypingHandler: {notif-01: [...],<br/>notif-07: [...],<br/>notif-12: [...]}
+    TypingHandler->>ChannelIdx: RUnlock()
+
+    Note over TypingHandler,Publisher: Exclude origin instance
+    TypingHandler->>TypingHandler: Filter out notif-07 (originator)
+    TypingHandler->>TypingHandler: Target list: [notif-01, notif-12]
+
+    TypingHandler->>Publisher: Enqueue(notif-01, typing_event)
+    TypingHandler->>Publisher: Enqueue(notif-12, typing_event)
+
+    Publisher->>NATSCore: Publish instance.events.notif-01
+    Publisher->>NATSCore: Publish instance.events.notif-12
+
+    Note over TypingHandler: No ACK needed<br/>(Core NATS, fire-and-forget)
+```
+
+### Key Internal Patterns
+
+| Pattern | Purpose | Performance |
+|---------|---------|-------------|
+| **RWMutex on indexes** | Concurrent reads, exclusive writes | Reads are lock-free under RLock |
+| **Batched fetch** | Reduce JetStream round-trips | 200 events per fetch |
+| **Batched publish** | Reduce Core NATS overhead | Flush every 1ms or 100 events |
+| **Single serialization** | Avoid redundant JSON encoding | Serialize once, publish N times |
+| **User index for eviction** | O(1) user removal | Avoids full channel scan |
+| **Membership cache** | Reduce MongoDB queries | LRU with 5-min TTL |
+
+### Data Structure Sizes (100K Online Users)
+
+| Structure | Entries | Memory |
+|-----------|---------|--------|
+| Channel → Instance Index | ~5M channels | ~1.5 GB |
+| User → Channels Index | ~100K users | ~500 MB |
+| Membership Cache | ~50K users (LRU) | ~200 MB |
+| **Total** | — | **~2.2 GB**

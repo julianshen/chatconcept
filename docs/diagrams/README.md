@@ -29,6 +29,11 @@ Key flows through the system:
 - **Thread Reply** — Dual-write strategy for threads
 - **Reconnection** — Tiered catchup protocol
 - **Read Receipt** — Hybrid receipt handling
+- **Fan-Out Service Internal** — Detailed internal processing flows:
+  - Message event processing with batched publish
+  - Presence change processing (online/offline)
+  - Membership change processing (join/leave)
+  - Typing indicator routing
 
 ## Rendering
 
