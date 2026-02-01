@@ -461,6 +461,7 @@ The Webhook Dispatcher tracks consecutive failures per webhook. If a webhook rea
 | `RECEIPTS` | `receipts.>` | WorkQueue | 7 days | 3 | Read/delivery receipts for small groups |
 | `EPHEMERAL` | `ephemeral.>` | WorkQueue | 5 min | 1 | Ephemeral messages (not persisted, immediate delivery only) |
 | `LINK_PREVIEW` | `link_preview.>` | WorkQueue | 1 hour | 3 | Link preview fetch requests and results |
+| `FILES` | `files.>` | WorkQueue | 24 hours | 3 | File upload processing (virus scan, thumbnails, metadata) |
 | `SYSTEM` | `system.>` | Limits | 7 days | 3 | Audit logs, admin events, internal signals |
 
 ### 4.2 Consumers
@@ -477,6 +478,9 @@ The Webhook Dispatcher tracks consecutive failures per webhook. If a webhook rea
 | `receipt-writer-pool` | RECEIPTS | Pull, Durable | `receipts.>` | Persist per-message receipts (small groups) |
 | `ephemeral-fan-out` | EPHEMERAL | Pull, Durable | `ephemeral.>` | Fan-out ephemeral messages to target user only |
 | `link-preview-pool` | LINK_PREVIEW | Pull, Durable | `link_preview.fetch.>` | Fetch URL metadata and publish previews |
+| `file-virus-scan` | FILES | Pull, Durable | `files.uploaded` | Virus scan uploaded files |
+| `file-thumbnail` | FILES | Pull, Durable | `files.uploaded` | Generate thumbnails for images/videos |
+| `file-metadata` | FILES | Pull, Durable | `files.uploaded` | Extract file metadata (dimensions, duration, etc.) |
 
 ### 4.3 Core NATS Subjects (Ephemeral, No Persistence)
 

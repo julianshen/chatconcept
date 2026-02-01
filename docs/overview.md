@@ -262,8 +262,9 @@ graph TB
 | **NATS JetStream** | Event backbone, durable streaming | All domain events with 30-day retention |
 | **Redis/Valkey** | Ephemeral state | Presence, typing indicators, routing metadata, permissions cache |
 | **Apache Cassandra** | Message history | Messages partitioned by (channel_id, daily_bucket) |
-| **MongoDB** | Metadata | Users, channels, permissions, settings, webhook registrations |
+| **MongoDB** | Metadata | Users, channels, permissions, settings, webhook registrations, file metadata |
 | **Elasticsearch** | Full-text search | Message content index with daily ILM |
+| **S3/MinIO** | File storage | Uploaded files, thumbnails, document previews |
 
 ---
 
