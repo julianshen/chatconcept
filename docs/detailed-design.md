@@ -27,6 +27,7 @@
 6. [Subscription & Fan-Out Architecture](#6-subscription--fan-out-architecture)
 7. [Event Replay and State Reconstruction](#7-event-replay-and-state-reconstruction)
 8. [Technical Considerations](#8-technical-considerations)
+9. [Multi-Region Deployment Topology](#9-multi-region-deployment-topology)
 
 ---
 
@@ -700,6 +701,121 @@ The routing table is entirely ephemeral and reconstructable from Redis (presence
 - **Metrics (Prometheus):** NATS lag, request rates, processing latency, connection counts
 - **Logging:** Structured JSON logs with correlation IDs
 - **Alerting:** Consumer lag, NACK rate, WebSocket drop rate, GC pauses
+
+---
+
+## 9. Multi-Region Deployment Topology
+
+This section describes the geo-distribution strategy for reducing latency for globally distributed users.
+
+### 9.1 Regional Edge + Global Backbone Architecture
+
+The platform supports multi-region deployment using a **Regional Edge + Global Backbone** pattern:
+
+```
+                    ┌─────────────────────────────────────┐
+                    │      NATS Super-Cluster (Global)    │
+                    │  ┌─────────┐       ┌─────────┐      │
+                    │  │US-East  │◄─────►│US-West  │      │
+                    │  │ Cluster │       │ Cluster │      │
+                    │  └────┬────┘       └────┬────┘      │
+                    │       │   Gateway Links  │          │
+                    │  ┌────┴────┐       ┌────┴────┐      │
+                    │  │  EU     │◄─────►│  Asia   │      │
+                    │  │ Cluster │       │ Cluster │      │
+                    │  └─────────┘       └─────────┘      │
+                    └─────────────────────────────────────┘
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        │                           │                           │
+        ▼                           ▼                           ▼
+┌───────────────┐          ┌───────────────┐          ┌───────────────┐
+│ Regional Edge │          │ Regional Edge │          │ Regional Edge │
+│   US-East     │          │      EU       │          │     Asia      │
+│   (Primary)   │          │               │          │               │
+│               │          │               │          │               │
+│ • Fan-Out Svc │          │ • Notif Svc   │          │ • Notif Svc   │
+│ • Notif Svc   │          │ • Query Svc   │          │ • Query Svc   │
+│ • Query Svc   │          │ • Redis Read  │          │ • Redis Read  │
+│ • Cmd Svc     │          │ • Cassandra   │          │ • Cassandra   │
+│ • Workers     │          │   (LOCAL_ONE) │          │   (LOCAL_ONE) │
+│ • Redis Pri   │          │ • Mongo Sec   │          │ • Mongo Sec   │
+│ • Cassandra   │          │               │          │               │
+│ • Mongo Pri   │          │               │          │               │
+└───────────────┘          └───────────────┘          └───────────────┘
+```
+
+### 9.2 NATS Super-Cluster with Gateway Links
+
+Each region runs its own 3-node NATS cluster. Gateway links connect regional clusters with **interest-based forwarding**: only events with subscribers in remote regions traverse gateways.
+
+**Key benefit:** A message in a US-only channel never crosses the Atlantic — there's no subscriber interest in EU.
+
+| Stream | Replication | Cross-Region Behavior |
+|--------|-------------|----------------------|
+| MESSAGES | R=3 within primary DC | Events fan out via gateways to regional instance inboxes |
+| META | R=3 within primary DC | Consumed by workers in primary region only |
+| Core NATS subjects | No persistence | Interest-based gateway forwarding |
+
+### 9.3 Global Fan-Out Service
+
+At 50K users, the routing table is ~2GB — well within single-instance memory. The Fan-Out Service runs in the primary region (US-East) and publishes to all Notification Service instances globally via NATS gateway links.
+
+**Rationale for global (not regional) Fan-Out:**
+- Single source of truth for routing table
+- No distributed consensus complexity
+- Cross-region latency penalty (~100-150ms) is acceptable
+- Regional Fan-Out would require routing table synchronization
+
+### 9.4 Regional Services
+
+| Service | Deployment | Notes |
+|---------|------------|-------|
+| **API Gateway** | Every region | GeoDNS routes users to nearest region |
+| **Notification Service** | Every region | Users connect to nearest instances via WebSocket |
+| **Query Service** | Every region | Reads from regional data store replicas |
+| **Command Service** | Primary region only | All writes go to US-East |
+| **Fan-Out Service** | Primary region only | Routes events globally via gateways |
+| **Workers** | Primary region only | Consume from primary NATS cluster |
+
+### 9.5 Data Store Multi-DC Configuration
+
+**Apache Cassandra:**
+
+```sql
+CREATE KEYSPACE chat WITH replication = {
+  'class': 'NetworkTopologyStrategy',
+  'us-east': 3,
+  'eu-west': 3,
+  'asia': 3
+};
+```
+
+| Operation | Consistency | Rationale |
+|-----------|-------------|-----------|
+| Write | LOCAL_QUORUM | Durability in primary DC |
+| Read | LOCAL_ONE | Low latency from regional replica |
+
+**Redis/Valkey:**
+- Primary in US-East (all writes)
+- Read replicas in EU, Asia (async replication)
+- Regional Query Services read from local replica
+
+**MongoDB:**
+- Primary-Secondary topology
+- Primary in US-East, secondaries in EU/Asia
+- Read preference: `secondaryPreferred` with region tags
+
+### 9.6 Latency Targets
+
+| Scenario | Path | Target |
+|----------|------|--------|
+| Same-region message | User→Regional Notif→User | <50ms |
+| Cross-region message | User→Primary→Fan-Out→Gateway→Regional Notif→User | <300ms |
+| History query | User→Regional Query→Regional Cassandra | <30ms |
+| Presence propagation | User→Primary Redis→Replica | <200ms |
+
+For detailed deployment configuration and failure scenarios, see [Multi-Region Feature Documentation](./features/multi-region.md).
 
 ---
 

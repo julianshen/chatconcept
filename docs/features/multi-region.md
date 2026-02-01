@@ -1,0 +1,565 @@
+# Multi-Region Deployment
+
+**Author:** Architecture Team
+**Status:** Draft
+**Last Updated:** 2026-02-01
+
+---
+
+## Table of Contents
+
+1. [Overview](#1-overview)
+2. [Regional Topology](#2-regional-topology)
+3. [NATS Super-Cluster Configuration](#3-nats-super-cluster-configuration)
+4. [Regional Service Deployment](#4-regional-service-deployment)
+5. [Data Store Multi-DC Configuration](#5-data-store-multi-dc-configuration)
+6. [Client Routing](#6-client-routing)
+7. [Latency Optimization Patterns](#7-latency-optimization-patterns)
+8. [Failure Scenarios and Recovery](#8-failure-scenarios-and-recovery)
+9. [Deployment Checklist](#9-deployment-checklist)
+
+---
+
+## 1. Overview
+
+The multi-region deployment architecture enables low-latency real-time messaging for geographically distributed users. The design targets:
+
+- **Same-region message delivery:** <50ms
+- **Cross-region message delivery:** <300ms
+- **History queries:** <30ms (from regional replicas)
+
+### Design Principles
+
+1. **Regional Edge + Global Backbone:** Users connect to geographically nearest services; global coordination happens via NATS gateway links
+2. **Global Fan-Out, Regional Delivery:** The Fan-Out Service remains centralized for simplicity; Notification Services are regional
+3. **Read-Local, Write-Global:** Queries read from regional replicas; writes go to primary region
+4. **Graceful Degradation:** Regional failures increase latency but don't cause outages
+
+---
+
+## 2. Regional Topology
+
+### Initial Deployment (3 Regions)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           NATS Super-Cluster                             │
+│                                                                          │
+│    US-East (Primary)         US-West              EU-West               │
+│    ┌─────────────┐       ┌─────────────┐     ┌─────────────┐           │
+│    │ NATS Cluster│◄─────►│ NATS Cluster│◄───►│ NATS Cluster│           │
+│    │   (3 nodes) │       │   (3 nodes) │     │   (3 nodes) │           │
+│    └──────┬──────┘       └──────┬──────┘     └──────┬──────┘           │
+│           │                     │                   │                    │
+│           │    Gateway Links (Interest-Based)       │                    │
+│           │◄────────────────────┼───────────────────►                    │
+│                                 │                                        │
+│                          ┌──────┴──────┐                                 │
+│                          │ Asia-Pacific│                                 │
+│                          │ NATS Cluster│                                 │
+│                          │   (3 nodes) │                                 │
+│                          └─────────────┘                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐
+│   US-East (Primary) │ │      EU-West        │ │    Asia-Pacific     │
+│                     │ │                     │ │                     │
+│ ┌─────────────────┐ │ │ ┌─────────────────┐ │ │ ┌─────────────────┐ │
+│ │  Command Svc    │ │ │ │  Query Svc      │ │ │ │  Query Svc      │ │
+│ │  Fan-Out Svc    │ │ │ │  Notif Svc      │ │ │ │  Notif Svc      │ │
+│ │  Query Svc      │ │ │ │  API Gateway    │ │ │ │  API Gateway    │ │
+│ │  Notif Svc      │ │ │ └─────────────────┘ │ │ └─────────────────┘ │
+│ │  All Workers    │ │ │                     │ │                     │
+│ │  API Gateway    │ │ │ ┌─────────────────┐ │ │ ┌─────────────────┐ │
+│ └─────────────────┘ │ │ │  Cassandra DC   │ │ │ │  Cassandra DC   │ │
+│                     │ │ │  (replica)      │ │ │ │  (replica)      │ │
+│ ┌─────────────────┐ │ │ │  RF=3           │ │ │ │  RF=3           │ │
+│ │  Cassandra DC   │ │ │ └─────────────────┘ │ │ └─────────────────┘ │
+│ │  (primary)      │ │ │                     │ │                     │
+│ │  RF=3           │ │ │ ┌─────────────────┐ │ │ ┌─────────────────┐ │
+│ └─────────────────┘ │ │ │  Redis Replica  │ │ │ │  Redis Replica  │ │
+│                     │ │ └─────────────────┘ │ │ └─────────────────┘ │
+│ ┌─────────────────┐ │ │                     │ │                     │
+│ │  Redis Primary  │ │ │ ┌─────────────────┐ │ │ ┌─────────────────┐ │
+│ │  MongoDB Primary│ │ │ │  MongoDB Sec    │ │ │ │  MongoDB Sec    │ │
+│ │  Elasticsearch  │ │ │ └─────────────────┘ │ │ └─────────────────┘ │
+│ └─────────────────┘ │ │                     │ │                     │
+└─────────────────────┘ └─────────────────────┘ └─────────────────────┘
+```
+
+### Region Roles
+
+| Region | Role | Services | Data Stores |
+|--------|------|----------|-------------|
+| **US-East** | Primary | All services, all workers | Cassandra primary DC, Redis primary, MongoDB primary, Elasticsearch |
+| **EU-West** | Edge | Query Service, Notification Service, API Gateway | Cassandra replica DC, Redis read replica, MongoDB secondary |
+| **Asia-Pacific** | Edge | Query Service, Notification Service, API Gateway | Cassandra replica DC, Redis read replica, MongoDB secondary |
+| **US-West** | Edge (optional) | Query Service, Notification Service | Cassandra replica DC, Redis read replica |
+
+---
+
+## 3. NATS Super-Cluster Configuration
+
+### Gateway Configuration
+
+Each NATS cluster connects to other regional clusters via gateway links. Gateways use **interest-based forwarding**: subscription information propagates across gateways, but messages only traverse when there's a matching subscriber.
+
+```hcl
+# nats-server.conf for US-East cluster
+
+cluster {
+  name: "us-east"
+  listen: 0.0.0.0:6222
+  routes: [
+    "nats://nats-1.us-east:6222",
+    "nats://nats-2.us-east:6222",
+    "nats://nats-3.us-east:6222"
+  ]
+}
+
+gateway {
+  name: "us-east"
+  listen: 0.0.0.0:7222
+
+  gateways: [
+    {name: "us-west", urls: ["nats://nats-gw.us-west:7222"]},
+    {name: "eu-west", urls: ["nats://nats-gw.eu-west:7222"]},
+    {name: "asia",    urls: ["nats://nats-gw.asia:7222"]}
+  ]
+}
+
+jetstream {
+  store_dir: "/data/jetstream"
+  max_memory_store: 1GB
+  max_file_store: 100GB
+}
+```
+
+### JetStream Stream Replication
+
+JetStream streams can be configured for cross-region replication:
+
+```bash
+# Create MESSAGES stream with cross-cluster mirroring
+nats stream add MESSAGES \
+  --subjects "messages.>" \
+  --retention limits \
+  --max-age 30d \
+  --replicas 3 \
+  --cluster us-east
+
+# Create a mirror in EU for disaster recovery (optional)
+nats stream add MESSAGES_EU_MIRROR \
+  --mirror MESSAGES \
+  --cluster eu-west
+```
+
+### Interest-Based Forwarding
+
+When a Notification Service instance in EU subscribes to `instance.events.notif-eu-01`, the subscription propagates to the US-East gateway. When the Fan-Out Service publishes to that subject, NATS routes the message across the gateway.
+
+**Key benefit:** Messages for channels with only US members never cross the Atlantic — there's no subscriber interest in EU.
+
+---
+
+## 4. Regional Service Deployment
+
+### Notification Service (Regional)
+
+Each region runs its own pool of Notification Service instances. Users connect to the nearest region via GeoDNS or Anycast.
+
+```yaml
+# Kubernetes deployment for EU region
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: chat-eu
+spec:
+  replicas: 10
+  template:
+    spec:
+      containers:
+      - name: notification-service
+        env:
+        - name: NATS_URL
+          value: "nats://nats-cluster.eu-west:4222"
+        - name: INSTANCE_REGION
+          value: "eu-west"
+        - name: REDIS_URL
+          value: "redis://redis-replica.eu-west:6379"
+```
+
+**Instance Naming Convention:**
+```
+notif-{region}-{instance_number}
+# Examples: notif-us-east-01, notif-eu-west-03, notif-asia-07
+```
+
+### Query Service (Regional)
+
+Regional Query Services read from local data store replicas:
+
+```yaml
+env:
+- name: CASSANDRA_CONTACT_POINTS
+  value: "cassandra-1.eu-west,cassandra-2.eu-west,cassandra-3.eu-west"
+- name: CASSANDRA_LOCAL_DC
+  value: "eu-west"
+- name: CASSANDRA_CONSISTENCY_READ
+  value: "LOCAL_ONE"
+- name: MONGODB_READ_PREFERENCE
+  value: "secondaryPreferred"
+- name: MONGODB_READ_PREFERENCE_TAGS
+  value: '[{"region": "eu-west"}]'
+```
+
+### Fan-Out Service (Global — Primary Region Only)
+
+The Fan-Out Service runs only in the primary region. It publishes to instance inboxes across all regions via NATS gateway links.
+
+```yaml
+# Only deployed in US-East
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fan-out-service
+  namespace: chat-us-east
+spec:
+  replicas: 3
+  template:
+    spec:
+      nodeSelector:
+        topology.kubernetes.io/region: us-east-1
+```
+
+---
+
+## 5. Data Store Multi-DC Configuration
+
+### Apache Cassandra
+
+**Topology:**
+
+| DC | Nodes | Replication Factor | Purpose |
+|----|-------|-------------------|---------|
+| us-east | 3 | 3 | Primary (writes) |
+| eu-west | 3 | 3 | Read replica |
+| asia | 3 | 3 | Read replica |
+
+**Keyspace Configuration:**
+
+```sql
+CREATE KEYSPACE chat WITH replication = {
+  'class': 'NetworkTopologyStrategy',
+  'us-east': 3,
+  'eu-west': 3,
+  'asia': 3
+};
+```
+
+**Consistency Levels:**
+
+| Operation | Consistency Level | Rationale |
+|-----------|------------------|-----------|
+| Message write | LOCAL_QUORUM | Durability in primary DC |
+| Message read | LOCAL_ONE | Low latency from regional replica |
+| Counter update | LOCAL_QUORUM | Correctness for reply counts |
+
+**Estimated Replication Lag:** 100-200ms between US-East and EU/Asia DCs.
+
+### Redis/Valkey
+
+**Topology:**
+- Primary: US-East (handles all writes)
+- Read Replicas: EU-West, Asia-Pacific (async replication)
+
+```bash
+# Redis replication setup on EU replica
+redis-cli replicaof redis-primary.us-east 6379
+```
+
+**Regional Query Services configuration:**
+
+```yaml
+# EU Query Service
+REDIS_URL: "redis://redis-replica.eu-west:6379"
+REDIS_READ_ONLY: "true"
+
+# Presence writes still go to primary via Command Service in US-East
+```
+
+### MongoDB
+
+**Topology:** Primary-Secondary-Secondary-Secondary-Arbiter (PSSAA)
+
+| Member | Region | Role | Priority |
+|--------|--------|------|----------|
+| mongo-1 | us-east | Primary | 10 |
+| mongo-2 | us-east | Secondary | 9 |
+| mongo-3 | eu-west | Secondary | 5 |
+| mongo-4 | asia | Secondary | 5 |
+| arbiter | us-east | Arbiter | 0 |
+
+**Read Preference:**
+
+```javascript
+// Regional Query Service
+db.getMongo().setReadPref("secondaryPreferred", [
+  { "region": "eu-west" },  // Prefer local region
+  { "region": "us-east" }   // Fallback to primary DC
+]);
+```
+
+---
+
+## 6. Client Routing
+
+### GeoDNS Configuration
+
+```
+; DNS Zone configuration
+api.chat.example.com.  300  IN  A  203.0.113.10  ; US-East (default)
+api.chat.example.com.  300  IN  A  203.0.113.20  ; EU-West (geo: EU)
+api.chat.example.com.  300  IN  A  203.0.113.30  ; Asia (geo: APAC)
+
+ws.chat.example.com.   300  IN  A  203.0.113.11  ; US-East WebSocket
+ws.chat.example.com.   300  IN  A  203.0.113.21  ; EU-West WebSocket
+ws.chat.example.com.   300  IN  A  203.0.113.31  ; Asia WebSocket
+```
+
+### Anycast Alternative
+
+For more precise routing, use Anycast IP addresses with regional load balancers:
+
+```
+                    User Request
+                         │
+                         ▼
+                  ┌──────────────┐
+                  │  Anycast IP  │
+                  │ 198.51.100.1 │
+                  └──────┬───────┘
+                         │
+         ┌───────────────┼───────────────┐
+         │               │               │
+         ▼               ▼               ▼
+    ┌─────────┐    ┌─────────┐    ┌─────────┐
+    │ US-East │    │ EU-West │    │  Asia   │
+    │   LB    │    │   LB    │    │   LB    │
+    └─────────┘    └─────────┘    └─────────┘
+```
+
+---
+
+## 7. Latency Optimization Patterns
+
+### Same-Region Message Flow (<50ms)
+
+```
+Alice (EU) sends message to #general (mostly EU members)
+
+1. Alice → EU API Gateway → US-East Command Service    [~80ms]
+2. Command Service → US-East NATS JetStream            [~1ms]
+3. US-East NATS → Fan-Out Service                      [~1ms]
+4. Fan-Out Service → NATS (instance inboxes)           [~1ms]
+5. US-East NATS Gateway → EU NATS Gateway              [~80ms]
+6. EU NATS → EU Notification Service                   [~1ms]
+7. EU Notification Service → Bob (EU)                  [~5ms]
+
+Total: ~170ms end-to-end
+
+Optimization: Local event echo
+- Client displays optimistic UI immediately
+- Server confirms via WebSocket notification
+- Perceived latency: <50ms
+```
+
+### Cross-Region Message Flow (<300ms)
+
+```
+Alice (EU) sends message to #global (US + EU + Asia members)
+
+1. Alice → EU Gateway → US-East Command Service        [~80ms]
+2. Command Service → NATS JetStream                    [~1ms]
+3. Fan-Out Service routes to 3 regions:
+   - US-East instances: direct (~1ms)
+   - EU instances: gateway (~80ms)
+   - Asia instances: gateway (~150ms)
+4. Regional Notification Services → Users              [~5ms]
+
+Total to US users: ~90ms
+Total to EU users: ~170ms
+Total to Asia users: ~240ms
+```
+
+### Query Latency Optimization
+
+Regional Query Services read from local Cassandra replicas:
+
+```
+Bob (Asia) loads #general message history
+
+1. Bob → Asia API Gateway                              [~5ms]
+2. Asia API Gateway → Asia Query Service               [~1ms]
+3. Asia Query Service → Asia Cassandra (LOCAL_ONE)    [~10ms]
+4. Response to Bob                                     [~5ms]
+
+Total: ~21ms (vs ~250ms if reading from US-East)
+```
+
+### Presence Update Propagation
+
+```
+Carol (Asia) comes online
+
+1. Asia Notification Service → US-East Redis           [~150ms write]
+2. US-East Redis → EU/Asia Redis replicas             [~100ms async]
+3. Fan-Out Service sees presence change               [~5ms via pub/sub]
+4. Fan-Out Service routes to interested instances     [~80-150ms gateway]
+
+Total propagation: ~200-300ms for global visibility
+```
+
+---
+
+## 8. Failure Scenarios and Recovery
+
+### Scenario 1: Regional NATS Cluster Failure
+
+**Impact:** Users in affected region cannot receive real-time updates.
+
+**Detection:**
+- NATS cluster health checks fail
+- Gateway connection errors in other regions
+- Notification Service connection failures
+
+**Recovery:**
+1. GeoDNS/LB shifts traffic to next-nearest region
+2. Users reconnect to healthy region (increased latency)
+3. NATS cluster recovers via RAFT leader election
+4. Traffic gradually returns to recovered region
+
+**Data Loss:** None — JetStream events buffered in primary region.
+
+### Scenario 2: Gateway Link Failure (Network Partition)
+
+**Impact:** Cross-region message delivery stops; same-region delivery continues.
+
+**Detection:**
+- Gateway link heartbeat failures
+- Consumer lag increases for cross-region instances
+
+**Recovery:**
+1. NATS buffers messages for affected region
+2. Network path restored (or rerouted via tertiary gateway)
+3. Buffered messages drain automatically
+4. No manual intervention required
+
+**RTO:** Automatic recovery when network restores (typically <5 minutes).
+
+### Scenario 3: Regional Cassandra DC Failure
+
+**Impact:** Query Service in affected region falls back to remote DC.
+
+**Detection:**
+- Cassandra node health checks fail
+- Query latency increases in affected region
+
+**Recovery:**
+1. Token-aware client routes to next-nearest DC
+2. Queries served from remote DC (higher latency)
+3. Failed DC nodes replaced and bootstrapped
+4. Data streams back via repair
+
+**Fallback Consistency:**
+```yaml
+# Dynamic consistency level adjustment
+CASSANDRA_CONSISTENCY_READ: "LOCAL_ONE"
+CASSANDRA_FALLBACK_CONSISTENCY: "ONE"  # Cross-DC fallback
+```
+
+### Scenario 4: Primary Region (US-East) Complete Failure
+
+**Impact:** All writes fail; reads continue from regional replicas.
+
+**Detection:**
+- Command Service unreachable
+- Fan-Out Service unreachable
+- Write operations return 503
+
+**Manual Failover Procedure:**
+1. Promote EU-West to primary (MongoDB election, Cassandra DC promotion)
+2. Deploy Command Service and Fan-Out Service to EU-West
+3. Update NATS gateway configuration
+4. DNS cutover to EU-West endpoints
+
+**RTO:** 15-30 minutes for manual failover.
+
+**RPO:** Potential loss of in-flight events not yet persisted to Cassandra.
+
+### Scenario 5: Redis Primary Failure
+
+**Impact:** Presence updates fail; stale presence data in regional replicas.
+
+**Detection:**
+- Redis primary health check failures
+- Notification Service presence write errors
+
+**Recovery:**
+1. Redis Sentinel promotes replica to primary
+2. Other replicas reconfigure to new primary
+3. Presence data self-heals via TTL expiry (120s)
+
+**RTO:** 10-30 seconds for Sentinel failover.
+
+---
+
+## 9. Deployment Checklist
+
+### Pre-Deployment
+
+- [ ] NATS clusters deployed in all target regions (3 nodes each)
+- [ ] Gateway links configured and tested between all region pairs
+- [ ] Cassandra multi-DC keyspace created with correct RF
+- [ ] Redis replication configured between regions
+- [ ] MongoDB replica set configured with regional members
+- [ ] GeoDNS or Anycast configured for client routing
+- [ ] Monitoring dashboards created for cross-region metrics
+
+### Service Deployment
+
+- [ ] API Gateway deployed in each region
+- [ ] Notification Service deployed in each region
+- [ ] Query Service deployed in each region
+- [ ] Command Service deployed in primary region
+- [ ] Fan-Out Service deployed in primary region
+- [ ] Workers deployed in primary region
+
+### Validation
+
+- [ ] Same-region message delivery <50ms (p95)
+- [ ] Cross-region message delivery <300ms (p95)
+- [ ] Regional query latency <30ms (p95)
+- [ ] Gateway link failover tested
+- [ ] Regional NATS cluster failover tested
+- [ ] Cassandra DC failover tested
+- [ ] Load test with realistic cross-region traffic patterns
+
+### Monitoring
+
+- [ ] NATS gateway link latency and throughput
+- [ ] Cross-region message delivery latency percentiles
+- [ ] Cassandra cross-DC replication lag
+- [ ] Redis replication lag
+- [ ] Regional Notification Service connection counts
+- [ ] Per-region error rates
+
+---
+
+## Related Documents
+
+- [ADR-010: Multi-Region Deployment](../adrs/ADR-010-multi-region-deployment.md) — Decision rationale
+- [Detailed Design](../detailed-design.md) — Service specifications
+- [Risks and Mitigations](../appendices/risks.md) — Cross-region failure risks
+- [Implementation Plan](../appendices/implementation-plan.md) — Phase 7: Multi-Region

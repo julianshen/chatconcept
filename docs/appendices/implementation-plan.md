@@ -20,6 +20,7 @@ This document outlines the phased implementation approach for the Communication 
 | **4: Workers & Webhooks** | Build Search Indexer, Push Notification Worker, Meta Writer. Build Webhook Dispatcher with outgoing delivery, retry, HMAC signing, delivery log, auto-disable. Build incoming webhook endpoint in Command Service. Set up Elasticsearch. Set up WEBHOOKS stream and webhook Cassandra tables. | 3–4 weeks | Phase 1 | Medium |
 | **5: Migration & Cutover** | Data migration from MongoDB messages to Cassandra. Dual-write period. Shadow traffic testing. Gradual client cutover. Migrate existing Rocket.Chat integrations to incoming/outgoing webhook model. | 3–4 weeks | Phases 1–4 | High |
 | **6: Decommission** | Remove Meteor.js oplog tailing. Remove message collections from MongoDB. Optimize and tune. | 1–2 weeks | Phase 5 stable | Low |
+| **7: Multi-Region** | Deploy NATS super-cluster with gateway links. Set up regional Cassandra DCs, Redis replicas, MongoDB secondaries. Deploy regional Notification and Query Services. Configure GeoDNS routing. | 4–6 weeks | Phase 6 stable | High |
 
 ---
 
@@ -180,6 +181,84 @@ This document outlines the phased implementation approach for the Communication 
 
 ---
 
+### Phase 7: Multi-Region Deployment (4-6 weeks)
+
+**Objectives:**
+- Reduce latency for globally distributed users
+- Deploy regional edge services
+- Enable cross-region message delivery via NATS super-clusters
+
+**Sub-phases:**
+
+#### Phase 7.1: Regional Infrastructure (2 weeks)
+
+**Deliverables:**
+- [ ] EU-West Kubernetes cluster provisioned
+- [ ] Asia-Pacific Kubernetes cluster provisioned
+- [ ] NATS 3-node cluster deployed in each region
+- [ ] NATS gateway links configured between regions
+- [ ] Gateway link latency and health monitoring
+
+**Success Criteria:**
+- NATS gateway links operational between all regions
+- Gateway link latency <100ms for US-EU, <200ms for US-Asia
+- Interest-based forwarding validated
+
+#### Phase 7.2: Data Store Replication (2 weeks)
+
+**Deliverables:**
+- [ ] Cassandra NetworkTopologyStrategy keyspace configured
+- [ ] Cassandra nodes deployed in EU-West DC (3 nodes, RF=3)
+- [ ] Cassandra nodes deployed in Asia DC (3 nodes, RF=3)
+- [ ] Cross-DC replication validated (<200ms lag)
+- [ ] Redis read replicas deployed in EU and Asia
+- [ ] MongoDB secondaries deployed in EU and Asia
+- [ ] Read preference tags configured for regional routing
+
+**Success Criteria:**
+- Cassandra cross-DC replication lag <200ms (p95)
+- Redis replica lag <100ms
+- MongoDB secondaries in sync
+- Regional Query Services can read from local replicas
+
+#### Phase 7.3: Regional Service Deployment (1-2 weeks)
+
+**Deliverables:**
+- [ ] API Gateway deployed in EU-West and Asia
+- [ ] Query Service deployed in EU-West and Asia
+- [ ] Notification Service deployed in EU-West (5 instances)
+- [ ] Notification Service deployed in Asia (5 instances)
+- [ ] GeoDNS configured for regional routing
+- [ ] Health checks configured for regional failover
+
+**Success Criteria:**
+- Users routed to nearest region via GeoDNS
+- Same-region message delivery <50ms (p95)
+- Cross-region message delivery <300ms (p95)
+- Regional query latency <30ms (p95)
+
+#### Phase 7.4: Validation and Cutover (1 week)
+
+**Deliverables:**
+- [ ] Load testing with realistic cross-region traffic patterns
+- [ ] Gateway link failover tested
+- [ ] Regional NATS cluster failover tested
+- [ ] Cassandra DC failover tested
+- [ ] Runbooks for multi-region operations
+- [ ] Monitoring dashboards for cross-region metrics
+
+**Success Criteria:**
+- All failover scenarios tested and documented
+- Latency SLOs met under load
+- Operations team trained on multi-region procedures
+
+**Risk Mitigation:**
+- Deploy EU-West first, validate, then add Asia
+- Start with small percentage of traffic per region
+- Maintain ability to route all traffic to primary region
+
+---
+
 ## Rollout Strategy
 
 ### 1. Shadow Mode
@@ -236,3 +315,4 @@ Gateway routing can switch back to Meteor.js instantly:
 | **M5: Full Feature Parity** | End of Phase 4 | Search, push, webhooks |
 | **M6: Production Cutover** | End of Phase 5 | 100% traffic on new system |
 | **M7: Legacy Decommissioned** | End of Phase 6 | Clean architecture |
+| **M8: Multi-Region Live** | End of Phase 7 | Global edge deployment, <50ms same-region latency |

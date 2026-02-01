@@ -15,6 +15,7 @@ This directory contains Architecture Decision Records (ADRs) documenting key tec
 | [ADR-007](./ADR-007-tiered-reconnection.md) | Tiered Client Reconnection Strategy | Accepted | 2026-02-01 |
 | [ADR-008](./ADR-008-hybrid-receipts.md) | Hybrid Read Receipts | Accepted | 2026-02-01 |
 | [ADR-009](./ADR-009-fanout-partitioning.md) | Fan-Out Consistent Hash Partitioning | Proposed | 2026-02-01 |
+| [ADR-010](./ADR-010-multi-region-deployment.md) | Multi-Region Deployment with NATS Super-Clusters | Accepted | 2026-02-01 |
 
 ## ADR Template
 
@@ -66,3 +67,6 @@ When creating a new ADR, use the following template:
 
 ### Scaling
 - ADR-009: Fan-Out Partitioning
+
+### Deployment
+- ADR-010: Multi-Region Deployment

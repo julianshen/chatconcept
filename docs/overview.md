@@ -30,7 +30,7 @@ This document outlines the architectural transformation from a monolithic, Mongo
 - Achieve true horizontal scalability using NATS JetStream
 - Implement polyglot persistence (splitting metadata and message history)
 - Support users in 100,000+ channels without performance degradation
-- Enable cross-region low latency via edge computing (future)
+- Enable cross-region low latency via NATS super-clusters and regional edge services
 
 **Key Innovation:** The **instance-level fan-out architecture** reduces NATS subscription count from O(users × channels) — potentially billions — to O(instances), approximately 121 system-wide subscriptions.
 
@@ -74,7 +74,7 @@ The current per-channel subscription model breaks down when users belong to hund
 - Full rewrite of client applications
 - DDP protocol compatibility — clients will migrate to a lightweight WebSocket JSON protocol
 - Replacing MongoDB entirely — it remains appropriate for metadata
-- Multi-region active-active replication (Phase 2 concern)
+- Multi-region active-active writes (single primary region for writes; regional read replicas)
 
 ---
 

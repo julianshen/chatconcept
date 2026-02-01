@@ -23,6 +23,10 @@ This document catalogs identified risks and their mitigation strategies for the 
 | WebSocket protocol migration (from DDP) | High | Medium | Versioned protocol; client library abstraction layer; support both protocols during transition |
 | Webhook SSRF / abuse | Medium | High | URL allowlist/denylist validation; outbound request timeout (5s); rate limiting per webhook; HMAC signature prevents spoofing; no private/internal network access from webhook workers |
 | Webhook delivery backlog during bot outage | Medium | Medium | WEBHOOKS stream has 7-day retention; auto-disable after 50 failures prevents infinite retry; backlog clears when bot recovers |
+| Cross-region network partition | Low | High | NATS gateway link failure isolates regions; messages buffer until connectivity restored; GeoDNS failover to alternate region |
+| Regional NATS cluster failure | Low | High | Users in affected region cannot receive real-time updates; GeoDNS redirects to next-nearest region; automatic recovery via RAFT |
+| Cassandra cross-DC replication lag | Medium | Low | Regional reads may serve stale data (100-200ms lag); acceptable for message history; real-time updates via WebSocket are authoritative |
+| Primary region complete failure | Very Low | Critical | All writes fail; manual failover to secondary region required (15-30min RTO); regional read replicas continue serving queries |
 
 ---
 
@@ -313,3 +317,146 @@ Likelihood │            │ complexity,   │             │
 3. Wait for routing table reconstruction (~60s)
 4. Events drain from buffer automatically
 5. Monitor for any missed deliveries
+
+---
+
+## Cross-Region Risks
+
+### Cross-Region Network Partition (Gateway Link Failure)
+
+**Risk:** Network issues between regions sever NATS gateway links, preventing cross-region message delivery.
+
+**Likelihood:** Low — Requires failure of both primary and backup network paths.
+
+**Impact:** High — Users in isolated region miss messages from other regions.
+
+**Mitigations:**
+1. NATS buffers messages for disconnected regions
+2. Multiple gateway endpoints per region for redundancy
+3. GeoDNS can redirect users to alternate region if partition persists
+4. JetStream provides durability during brief outages
+5. Monitoring on gateway link latency and throughput
+
+**Detection:**
+- Gateway link heartbeat failures
+- Consumer lag spike for cross-region Notification Service instances
+- Cross-region message delivery latency alerts
+
+**Recovery:**
+1. Network path automatically restores (typically <5 minutes)
+2. Buffered messages drain to affected region
+3. No manual intervention required for transient partitions
+4. For prolonged partitions, redirect users via DNS failover
+
+---
+
+### Regional NATS Cluster Failure
+
+**Risk:** All 3 NATS nodes in a regional cluster fail simultaneously.
+
+**Likelihood:** Low — Requires multiple simultaneous failures.
+
+**Impact:** High — Users connected to that region cannot receive real-time updates.
+
+**Mitigations:**
+1. RAFT-based leader election within cluster
+2. Placement across multiple availability zones
+3. GeoDNS health checks redirect to healthy regions
+4. Users can manually reconnect to alternate region
+5. Primary region NATS continues operating independently
+
+**Detection:**
+- NATS cluster health metrics
+- Regional Notification Service connection failures
+- User connection drop alerts
+
+**Recovery:**
+1. GeoDNS/LB shifts WebSocket traffic to next-nearest region
+2. Users reconnect with increased latency
+3. Failed region NATS cluster recovers via RAFT
+4. Traffic gradually returns when health checks pass
+
+---
+
+### Cassandra Cross-DC Replication Lag
+
+**Risk:** Async replication between DCs creates read inconsistency window.
+
+**Likelihood:** Medium — Inherent in async replication design.
+
+**Impact:** Low — Users may see slightly stale message history.
+
+**Mitigations:**
+1. Real-time WebSocket notifications are authoritative (not affected)
+2. 100-200ms lag is acceptable for historical data
+3. Regional Query Services use LOCAL_ONE for low latency
+4. Monitor replication lag metrics
+5. Can temporarily switch to cross-DC consistency if needed
+
+**Acceptable Because:**
+- WebSocket delivers new messages in real-time before DB replication
+- Message history queries tolerate brief staleness
+- Users refresh naturally as they scroll
+
+---
+
+### Primary Region Complete Failure
+
+**Risk:** US-East region (primary) suffers complete outage affecting Command Service, Fan-Out Service, and primary data stores.
+
+**Likelihood:** Very Low — Requires catastrophic regional failure.
+
+**Impact:** Critical — All write operations fail; only regional reads continue.
+
+**Mitigations:**
+1. Regional read replicas continue serving queries
+2. Regional Notification Services maintain existing WebSocket connections
+3. Documented manual failover procedure
+4. Cassandra can promote secondary DC to primary
+5. MongoDB can elect new primary from secondaries
+
+**Manual Failover Procedure:**
+1. Verify primary region is unrecoverable (15-minute observation)
+2. Promote EU-West Cassandra DC to primary
+3. MongoDB election happens automatically (may need manual intervention)
+4. Deploy Command Service and Fan-Out Service to EU-West
+5. Update NATS gateway configuration
+6. DNS cutover to EU-West as new primary
+7. Communicate to users about potential data inconsistency window
+
+**RTO:** 15-30 minutes for manual failover
+
+**RPO:** Potential loss of in-flight events not yet replicated to secondary DCs
+
+---
+
+## Updated Risk Assessment Matrix
+
+```
+           │ Low Impact │ Medium Impact │ High Impact │ Critical Impact
+───────────┼────────────┼───────────────┼─────────────┼────────────────
+Very Low   │            │               │             │ NATS cluster
+Likelihood │            │               │             │ failure,
+           │            │               │             │ Primary region
+           │            │               │             │ failure
+───────────┼────────────┼───────────────┼─────────────┼────────────────
+Low        │            │               │ Partition   │
+Likelihood │            │               │ hotspot,    │
+           │            │               │ Routing     │
+           │            │               │ corruption, │
+           │            │               │ Network     │
+           │            │               │ partition,  │
+           │            │               │ Regional    │
+           │            │               │ NATS fail   │
+───────────┼────────────┼───────────────┼─────────────┼────────────────
+Medium     │ Cassandra  │ GC pauses,    │ Webhook     │
+Likelihood │ replication│ Cold start,   │ SSRF        │
+           │ lag        │ Consistency,  │             │
+           │            │ Webhook       │             │
+           │            │ backlog       │             │
+───────────┼────────────┼───────────────┼─────────────┼────────────────
+High       │            │ Operational   │             │
+Likelihood │            │ complexity,   │             │
+           │            │ Protocol      │             │
+           │            │ migration     │             │
+```

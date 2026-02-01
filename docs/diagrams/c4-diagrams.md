@@ -264,3 +264,132 @@ C4Component
 | Channel → Instance Index | ~2GB | Primary routing lookup |
 | User → Channels Index | ~200MB | Fast user eviction |
 | Membership Cache | ~500MB | Reduce MongoDB queries |
+
+---
+
+## 5. Deployment Diagram — Multi-Region Topology
+
+Shows the physical deployment across geographic regions with NATS super-clusters and regional edge services.
+
+```mermaid
+C4Deployment
+    title Deployment Diagram — Multi-Region Communication Platform
+
+    Deployment_Node(aws, "AWS Cloud", "Multi-Region") {
+
+        Deployment_Node(useast, "US-East (Primary Region)", "us-east-1") {
+            Deployment_Node(useast_k8s, "Kubernetes Cluster", "EKS") {
+                Container(useast_gw, "API Gateway", "Envoy", "TLS, routing, rate limiting")
+                Container(useast_cmd, "Command Service", "Go", "Write path, event publishing")
+                Container(useast_query, "Query Service", "Go", "Read path, REST API")
+                Container(useast_fanout, "Fan-Out Service", "Go", "Global routing table, instance routing")
+                Container(useast_notif, "Notification Service", "Go x10", "WebSocket termination")
+                Container(useast_workers, "Worker Pool", "Go", "Message/Meta/Search/Push/Webhook")
+            }
+
+            Deployment_Node(useast_nats, "NATS Cluster", "3-node") {
+                ContainerDb(useast_nats_js, "NATS JetStream", "R=3", "MESSAGES, META, WEBHOOKS streams")
+            }
+
+            Deployment_Node(useast_data, "Data Layer", "") {
+                ContainerDb(useast_cass, "Cassandra DC", "3-node, RF=3", "Primary DC for writes")
+                ContainerDb(useast_redis, "Redis Primary", "Cluster mode", "Presence, typing, routing metadata")
+                ContainerDb(useast_mongo, "MongoDB Primary", "Replica Set", "Metadata, webhooks, followers")
+                ContainerDb(useast_es, "Elasticsearch", "3-node", "Full-text search index")
+            }
+        }
+
+        Deployment_Node(euwest, "EU-West (Edge Region)", "eu-west-1") {
+            Deployment_Node(euwest_k8s, "Kubernetes Cluster", "EKS") {
+                Container(euwest_gw, "API Gateway", "Envoy", "TLS, routing, rate limiting")
+                Container(euwest_query, "Query Service", "Go", "Read from local replicas")
+                Container(euwest_notif, "Notification Service", "Go x5", "WebSocket termination")
+            }
+
+            Deployment_Node(euwest_nats, "NATS Cluster", "3-node") {
+                ContainerDb(euwest_nats_core, "NATS Core", "", "Gateway link to US-East")
+            }
+
+            Deployment_Node(euwest_data, "Data Layer (Replicas)", "") {
+                ContainerDb(euwest_cass, "Cassandra DC", "3-node, RF=3", "Replica DC, LOCAL_ONE reads")
+                ContainerDb(euwest_redis, "Redis Replica", "", "Read-only replica")
+                ContainerDb(euwest_mongo, "MongoDB Secondary", "", "Read preference: secondaryPreferred")
+            }
+        }
+
+        Deployment_Node(asia, "Asia-Pacific (Edge Region)", "ap-northeast-1") {
+            Deployment_Node(asia_k8s, "Kubernetes Cluster", "EKS") {
+                Container(asia_gw, "API Gateway", "Envoy", "TLS, routing, rate limiting")
+                Container(asia_query, "Query Service", "Go", "Read from local replicas")
+                Container(asia_notif, "Notification Service", "Go x5", "WebSocket termination")
+            }
+
+            Deployment_Node(asia_nats, "NATS Cluster", "3-node") {
+                ContainerDb(asia_nats_core, "NATS Core", "", "Gateway link to US-East")
+            }
+
+            Deployment_Node(asia_data, "Data Layer (Replicas)", "") {
+                ContainerDb(asia_cass, "Cassandra DC", "3-node, RF=3", "Replica DC, LOCAL_ONE reads")
+                ContainerDb(asia_redis, "Redis Replica", "", "Read-only replica")
+                ContainerDb(asia_mongo, "MongoDB Secondary", "", "Read preference: secondaryPreferred")
+            }
+        }
+    }
+
+    Deployment_Node(dns, "GeoDNS / Anycast", "Route 53 / Cloudflare") {
+        Container(geodns, "GeoDNS", "", "Routes users to nearest region")
+    }
+
+    Rel(geodns, useast_gw, "US users", "HTTPS/WSS")
+    Rel(geodns, euwest_gw, "EU users", "HTTPS/WSS")
+    Rel(geodns, asia_gw, "APAC users", "HTTPS/WSS")
+
+    Rel(useast_nats_js, euwest_nats_core, "Gateway Link", "Interest-based forwarding")
+    Rel(useast_nats_js, asia_nats_core, "Gateway Link", "Interest-based forwarding")
+
+    Rel(useast_cass, euwest_cass, "Async replication", "~100-200ms lag")
+    Rel(useast_cass, asia_cass, "Async replication", "~100-200ms lag")
+
+    Rel(useast_redis, euwest_redis, "Async replication", "")
+    Rel(useast_redis, asia_redis, "Async replication", "")
+
+    Rel(useast_mongo, euwest_mongo, "Replica sync", "")
+    Rel(useast_mongo, asia_mongo, "Replica sync", "")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+```
+
+### Regional Service Distribution
+
+| Service | US-East | EU-West | Asia-Pacific |
+|---------|---------|---------|--------------|
+| API Gateway | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Command Service | :white_check_mark: | :x: | :x: |
+| Query Service | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Fan-Out Service | :white_check_mark: | :x: | :x: |
+| Notification Service | :white_check_mark: (10) | :white_check_mark: (5) | :white_check_mark: (5) |
+| Workers | :white_check_mark: | :x: | :x: |
+
+### Data Store Replication
+
+| Store | US-East | EU-West | Asia-Pacific | Replication |
+|-------|---------|---------|--------------|-------------|
+| NATS JetStream | Primary (R=3) | Gateway link | Gateway link | Interest-based |
+| Cassandra | Primary DC | Replica DC | Replica DC | NetworkTopologyStrategy |
+| Redis | Primary | Read replica | Read replica | Async |
+| MongoDB | Primary | Secondary | Secondary | Replica set |
+| Elasticsearch | Primary | — | — | No replication |
+
+### Cross-Region Latency
+
+```
+                US-East ◄──── 80ms ────► EU-West
+                   │                        │
+                   │                        │
+                 150ms                    120ms
+                   │                        │
+                   ▼                        ▼
+              Asia-Pacific ◄── 100ms ──► EU-West
+```
+
+Expected round-trip latencies between regions (approximate).
